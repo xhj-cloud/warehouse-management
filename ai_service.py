@@ -50,7 +50,7 @@ class AIService:
         except requests.exceptions.Timeout:
             return "AI 分析服务超时，请稍后重试。"
         except requests.exceptions.ConnectionError:
-            return "无法连接到 LM Studio 服务，请确认服务是否已启动 (http://100.101.108.100:1234)。"
+            return f"无法连接到 LM Studio 服务，请确认服务是否已启动 ({self.base_url})。"
         except Exception as e:
             return f"AI 分析出错: {str(e)}"
 

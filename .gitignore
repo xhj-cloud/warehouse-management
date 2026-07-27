@@ -1,0 +1,10 @@
+venv/
+__pycache__/
+*.pyc
+.env
+*.log
+uploads/*
+!uploads/.gitkeep
+error.log
+.DS_Store
+库存数据导入模板.xlsx

@@ -16,7 +16,7 @@ MYSQL_CONFIG = {
 
 # LM Studio AI 配置
 LM_STUDIO_CONFIG = {
-    'base_url': os.getenv('LM_STUDIO_URL', 'http://100.101.108.100:1234/v1'),
+    'base_url': os.getenv('LM_STUDIO_URL', 'http://127.0.0.1:1234/v1'),
     'model': os.getenv('LM_STUDIO_MODEL', 'qwen3.6-35b-a3b'),
     'temperature': 0.7,
     'max_tokens': 4096,
