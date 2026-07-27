@@ -49,7 +49,23 @@ warehouse-management/
 └── uploads/                # 上传文件目录
 ```
 
-## 快速部署
+## 部署指南
+
+### 环境要求
+
+| 依赖 | 版本 |
+|------|------|
+| Python | 3.8+ |
+| MySQL | 5.7+ 或 8.0 |
+| pip | 最新版 |
+
+可选：Nginx（反向代理）、LM Studio（AI 功能）
+
+---
+
+### Ubuntu / Debian 服务器部署
+
+**方式一：一键部署脚本**
 
 ```bash
 # 1. 上传项目到服务器
@@ -59,6 +75,154 @@ scp -r warehouse-management/ user@server:~/桌面/
 cd ~/桌面/warehouse-management
 chmod +x deploy.sh
 ./deploy.sh
+```
+
+部署脚本会交互式询问 MySQL 密码、AI 地址、端口等，确认后自动完成全部配置。
+
+**方式二：手动部署**
+
+```bash
+# 1. 安装依赖
+sudo apt update && sudo apt install -y python3 python3-pip python3-venv mysql-server nginx
+
+# 2. 创建数据库
+sudo mysql -e "CREATE DATABASE warehouse_db CHARACTER SET utf8mb4;
+  CREATE USER 'warehouse'@'localhost' IDENTIFIED BY 'your_password';
+  GRANT ALL ON warehouse_db.* TO 'warehouse'@'localhost'; FLUSH PRIVILEGES;"
+
+# 3. 初始化表
+mysql -u warehouse -p warehouse_db < init_db.sql
+
+# 4. 安装 Python 依赖
+python3 -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
+
+# 5. 配置环境变量（修改 config.py 或创建 .env）
+# DB_HOST / DB_PASSWORD / LM_STUDIO_URL 等
+
+# 6. 启动
+python app.py
+# 访问 http://服务器IP:5050
+```
+
+**配置开机自启：**
+
+```bash
+sudo tee /etc/systemd/system/warehouse.service > /dev/null << EOF
+[Unit]
+Description=Warehouse Management System
+After=network.target
+
+[Service]
+Type=simple
+User=$USER
+WorkingDirectory=$(pwd)
+ExecStart=$(pwd)/venv/bin/python $(pwd)/app.py
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now warehouse
+```
+
+---
+
+### macOS 部署
+
+```bash
+# 1. 安装 Homebrew（如未安装）
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+
+# 2. 安装依赖
+brew install python@3 mysql
+
+# 3. 启动 MySQL
+brew services start mysql
+
+# 4. 创建数据库
+mysql -u root -e "CREATE DATABASE warehouse_db CHARACTER SET utf8mb4;
+  CREATE USER 'warehouse'@'localhost' IDENTIFIED BY 'warehouse123';
+  GRANT ALL ON warehouse_db.* TO 'warehouse'@'localhost'; FLUSH PRIVILEGES;"
+
+# 5. 安装运行
+cd warehouse-management
+python3 -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
+mysql -u warehouse -pwarehouse123 warehouse_db < init_db.sql
+python app.py
+
+# 访问 http://localhost:5050
+```
+
+---
+
+### Windows 部署
+
+**方式一：WSL2（推荐）**
+
+```powershell
+# 在 WSL2 Ubuntu 中按 Ubuntu 部署流程操作
+wsl --install -d Ubuntu
+```
+
+**方式二：原生 Windows**
+
+```powershell
+# 1. 安装 Python 3.8+（python.org 下载）
+# 2. 安装 MySQL 8.0（dev.mysql.com 下载）
+# 3. 打开 PowerShell
+
+cd warehouse-management
+python -m venv venv
+.\venv\Scripts\activate
+
+# 安装依赖（pymysql 需要编译工具）
+pip install -r requirements.txt
+
+# 如果 pymysql 安装失败，安装预编译版：
+# pip install pymysql --only-binary=:all:
+
+# 创建数据库
+mysql -u root -e "CREATE DATABASE warehouse_db CHARACTER SET utf8mb4;
+  CREATE USER 'warehouse'@'localhost' IDENTIFIED BY 'warehouse123';
+  GRANT ALL ON warehouse_db.* TO 'warehouse'@'localhost'; FLUSH PRIVILEGES;"
+
+mysql -u warehouse -pwarehouse123 warehouse_db < init_db.sql
+
+# 启动
+python app.py
+# 访问 http://localhost:5050
+```
+
+---
+
+### Docker 部署
+
+```bash
+# 使用 docker-compose
+docker compose up -d
+
+# 或手动构建
+docker build -t warehouse .
+docker run -d -p 5050:5050 \
+  -e DB_HOST=mysql_host \
+  -e DB_PASSWORD=your_password \
+  -e LM_STUDIO_URL=http://your-lmstudio:1234/v1 \
+  warehouse
+```
+
+### AI 配置（可选）
+
+AI 功能依赖 LM Studio，不配置也不影响基础仓库管理功能。
+
+```bash
+# 1. 在 AI 服务器上下载 LM Studio（lmstudio.ai）
+# 2. 下载模型 qwen3.6-35b-a3b 或其他兼容模型
+# 3. 启动 LM Studio 的本地 API 服务（默认端口 1234）
+# 4. 在 config.py 或 .env 中配置 LM_STUDIO_URL
 ```
 
 ## 数据库表
