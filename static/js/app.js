@@ -1,0 +1,1172 @@
+/**
+ * 仓库管理系统 - 前端 SPA 应用
+ */
+
+const API = '/api';
+let currentPage = 'dashboard';
+
+// ==========================================
+//  工具函数
+// ==========================================
+function $(sel) { return document.querySelector(sel); }
+function $$(sel) { return document.querySelectorAll(sel); }
+
+async function fetchAPI(url, options = {}) {
+    try {
+        const resp = await fetch(url, {
+            headers: { 'Content-Type': 'application/json', ...options.headers },
+            ...options,
+        });
+        return await resp.json();
+    } catch (err) {
+        return { success: false, error: `网络错误: ${err.message}` };
+    }
+}
+
+function formatDate(dateStr) {
+    if (!dateStr) return '-';
+    const d = new Date(dateStr);
+    return d.toLocaleString('zh-CN');
+}
+
+function showToast(message, type = 'info') {
+    const container = $('#toast-container');
+    const toast = document.createElement('div');
+    toast.className = `toast toast-${type}`;
+    toast.textContent = message;
+    toast.style.cssText = `
+        padding: 12px 20px; margin-bottom: 8px; border-radius: 8px;
+        color: #fff; font-size: 14px; animation: slideIn 0.3s ease;
+        ${type === 'success' ? 'background: #10b981;' :
+          type === 'error' ? 'background: #ef4444;' :
+          type === 'warning' ? 'background: #f59e0b;' :
+          'background: #3b82f6;'}
+    `;
+    container.appendChild(toast);
+    setTimeout(() => {
+        toast.style.opacity = '0';
+        toast.style.transition = 'opacity 0.3s';
+        setTimeout(() => toast.remove(), 300);
+    }, 3000);
+}
+
+// ==========================================
+//  页面导航
+// ==========================================
+function navigateTo(page) {
+    currentPage = page;
+    // 更新导航激活状态
+    $$('.nav-item').forEach(el => el.classList.remove('active'));
+    $(`.nav-item[data-page="${page}"]`)?.classList.add('active');
+    // 切换页面
+    $$('.page').forEach(el => el.classList.remove('active'));
+    $(`#page-${page}`)?.classList.add('active');
+    // 更新标题
+    const titles = {
+        dashboard: '仪表盘',
+        products: '商品管理',
+        inventory: '库存管理',
+        categories: '分类管理',
+        suppliers: '供应商管理',
+        customers: '客户管理',
+        logs: '操作日志',
+        order: '出库单',
+        transactions: '出入库记录',
+        upload: '数据导入',
+        ai: 'AI 智能分析',
+    };
+    $('#page-title').textContent = titles[page] || '';
+    // 加载数据
+    if (page === 'dashboard') loadDashboard();
+    if (page === 'products') loadProducts();
+    if (page === 'inventory') loadInventory();
+    if (page === 'categories') loadCategories();
+    if (page === 'suppliers') loadSuppliers();
+    if (page === 'customers') loadCustomers();
+    if (page === 'order') loadOrderPage();
+    if (page === 'transactions') loadTransactions();
+    if (page === 'logs') loadAuditLog();
+    if (page === 'upload') loadUploads();
+    if (page === 'ai') initAIPage();
+}
+
+$$('.nav-item').forEach(item => {
+    item.addEventListener('click', () => navigateTo(item.dataset.page));
+});
+
+// ==========================================
+//  仪表盘
+// ==========================================
+async function loadDashboard() {
+    const result = await fetchAPI(`${API}/dashboard`);
+    if (!result.success) {
+        showToast('加载仪表盘失败: ' + result.error, 'error');
+        return;
+    }
+    const d = result.data;
+    $('#stat-products').textContent = d.total_products;
+    $('#stat-categories').textContent = d.total_categories;
+    $('#stat-quantity').textContent = d.total_quantity.toLocaleString();
+    $('#stat-lowstock').textContent = d.low_stock_count;
+
+    // 加载低库存预警
+    const lowResult = await fetchAPI(`${API}/inventory/low-stock`);
+    if (lowResult.success) {
+        renderLowStockTable(lowResult.data);
+    }
+
+    // 加载最近交易
+    const txnResult = await fetchAPI(`${API}/transactions?limit=10`);
+    if (txnResult.success) {
+        renderRecentTransactions(txnResult.data);
+    }
+
+    // 渲染分类图表
+    if (d.category_stats) {
+        renderCategoryChart(d.category_stats);
+    }
+}
+
+function renderLowStockTable(items) {
+    const tbody = $('#low-stock-tbody');
+    if (!items || items.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#94a3b8;padding:20px;">暂无低库存预警 🎉</td></tr>';
+        return;
+    }
+    tbody.innerHTML = items.map(item => `
+        <tr>
+            <td><strong>${item.product_name}</strong></td>
+            <td>${item.sku}</td>
+            <td><span class="badge badge-danger">${item.quantity}</span></td>
+            <td>${item.min_stock}</td>
+            <td>${item.location || '-'}</td>
+        </tr>
+    `).join('');
+}
+
+function renderRecentTransactions(items) {
+    const tbody = $('#recent-txn-tbody');
+    if (!items || items.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:#94a3b8;padding:20px;">暂无交易记录</td></tr>';
+        return;
+    }
+    tbody.innerHTML = items.map(t => `
+        <tr>
+            <td>${t.product_name}</td>
+            <td><span class="badge ${t.type === 'in' ? 'badge-success' : 'badge-warning'}">${t.type === 'in' ? '入库' : '出库'}</span></td>
+            <td>${t.quantity}</td>
+            <td>${formatDate(t.created_at)}</td>
+        </tr>
+    `).join('');
+}
+
+function renderCategoryChart(stats) {
+    const canvas = $('#category-chart');
+    if (!canvas || !stats || stats.length === 0) return;
+
+    // 简单柱状图用纯CSS实现
+    const container = canvas.parentElement;
+    const maxQty = Math.max(...stats.map(s => s.total_qty), 1);
+    container.innerHTML = `
+        <div style="display:flex;align-items:flex-end;gap:20px;height:180px;padding-top:20px;">
+            ${stats.map(s => `
+                <div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:6px;">
+                    <span style="font-size:12px;font-weight:600;">${s.total_qty}</span>
+                    <div style="width:100%;max-width:60px;height:${(s.total_qty/maxQty)*140}px;
+                                background:linear-gradient(180deg, #3b82f6, #2563eb);
+                                border-radius:6px 6px 0 0;min-height:4px;"></div>
+                    <span style="font-size:11px;color:#64748b;text-align:center;">${s.name}</span>
+                </div>
+            `).join('')}
+        </div>
+    `;
+}
+
+// ==========================================
+//  商品管理
+// ==========================================
+let currentProducts = [];
+
+async function loadProducts() {
+    const keyword = $('#product-search')?.value || '';
+    const result = await fetchAPI(`${API}/products${keyword ? `?search=${encodeURIComponent(keyword)}` : ''}`);
+    if (result.success) {
+        currentProducts = result.data;
+        renderProductsTable(result.data);
+    } else {
+        showToast('加载商品失败: ' + result.error, 'error');
+    }
+}
+
+function renderProductsTable(products) {
+    const tbody = $('#products-tbody');
+    if (!products || products.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:#94a3b8;padding:30px;">暂无商品，请先导入数据</td></tr>';
+        return;
+    }
+    tbody.innerHTML = products.map(p => `
+        <tr>
+            <td><strong>${p.name}</strong></td>
+            <td>${p.sku}</td>
+            <td>${p.category_name || '-'}</td>
+            <td>${p.supplier_name || '-'}</td>
+            <td>${p.unit}</td>
+            <td>${p.specification || '-'}</td>
+            <td>${(p.quantity ?? 0).toLocaleString()}</td>
+            <td>${p.location || '-'}</td>
+            <td>
+                <div class="btn-group">
+                    <button class="btn btn-outline btn-sm" onclick="editProduct(${p.id})">编辑</button>
+                    <button class="btn btn-outline btn-sm" onclick="quickStockIn(${p.id},'${p.name}')">入库</button>
+                    <button class="btn btn-outline btn-sm" onclick="quickStockOut(${p.id},'${p.name}')">出库</button>
+                    <button class="btn btn-danger btn-sm" onclick="deleteProduct(${p.id},'${p.name}')">删除</button>
+                </div>
+            </td>
+        </tr>
+    `).join('');
+}
+
+async function loadCategoriesForSelect() {
+    const result = await fetchAPI(`${API}/categories`);
+    if (result.success) {
+        const select = $('#product-category');
+        if (select) {
+            select.innerHTML = '<option value="">请选择分类</option>' +
+                result.data.map(c => `<option value="${c.id}">${c.name}</option>`).join('');
+        }
+    }
+}
+
+function showProductModal(productId = null) {
+    loadCategoriesForSelect();
+    loadSuppliersForSelect();
+    const modal = $('#product-modal');
+    const title = $('#product-modal-title');
+    if (productId) {
+        title.textContent = '编辑商品';
+        const p = currentProducts.find(x => x.id === productId);
+        if (p) {
+            $('#product-id').value = p.id;
+            $('#product-name').value = p.name;
+            $('#product-sku').value = p.sku;
+            setTimeout(() => { $('#product-category').value = p.category_id || ''; }, 200);
+            setTimeout(() => { $('#product-supplier').value = p.supplier_id || ''; }, 250);
+            $('#product-unit').value = p.unit;
+            $('#product-spec').value = p.specification || '';
+            $('#product-unit-price').value = p.unit_price ?? 0;
+            $('#product-sale-price').value = p.sale_price ?? 0;
+            $('#product-location').value = p.location || '';
+            $('#product-quantity').value = p.quantity ?? 0;
+            $('#product-min-stock').value = p.min_stock ?? 0;
+            $('#product-max-stock').value = p.max_stock ?? 9999;
+            $('#product-desc').value = p.description || '';
+        }
+    } else {
+        title.textContent = '新增商品';
+        $('#product-id').value = '';
+        $('#product-form').reset();
+        $('#product-max-stock').value = '9999';
+    }
+    modal.classList.add('active');
+}
+
+function hideProductModal() {
+    $('#product-modal').classList.remove('active');
+}
+
+async function saveProduct() {
+    const id = $('#product-id').value;
+    const data = {
+        name: $('#product-name').value.trim(),
+        sku: $('#product-sku').value.trim(),
+        category_id: $('#product-category').value || null,
+        supplier_id: $('#product-supplier').value || null,
+        unit: $('#product-unit').value.trim() || '个',
+        specification: $('#product-spec').value.trim(),
+        description: $('#product-desc').value.trim(),
+        location: $('#product-location').value.trim(),
+        quantity: parseInt($('#product-quantity').value) || 0,
+        min_stock: parseInt($('#product-min-stock').value) || 0,
+        max_stock: parseInt($('#product-max-stock').value) || 9999,
+        unit_price: parseFloat($('#product-unit-price').value) || 0,
+        sale_price: parseFloat($('#product-sale-price').value) || 0,
+    };
+    if (!data.name || !data.sku) {
+        showToast('商品名称和 SKU 不能为空', 'warning');
+        return;
+    }
+    const url = id ? `${API}/products/${id}` : `${API}/products`;
+    const method = id ? 'PUT' : 'POST';
+    const result = await fetchAPI(url, { method, body: JSON.stringify(data) });
+    if (result.success) {
+        showToast(id ? '商品更新成功' : '商品创建成功', 'success');
+        hideProductModal();
+        loadProducts();
+    } else {
+        showToast('保存失败: ' + result.error, 'error');
+    }
+}
+
+async function deleteProduct(id, name) {
+    if (!confirm(`确定要删除商品 "${name}" 吗？此操作不可撤销。`)) return;
+    const result = await fetchAPI(`${API}/products/${id}`, { method: 'DELETE' });
+    if (result.success) {
+        showToast('删除成功', 'success');
+        loadProducts();
+    } else {
+        showToast('删除失败: ' + result.error, 'error');
+    }
+}
+
+function editProduct(id) { showProductModal(id); }
+
+// ==========================================
+//  快速出入库
+// ==========================================
+async function quickStockIn(productId, name) {
+    var qty = prompt('请输入 "' + name + '" 入库数量:');
+    if (!qty || isNaN(qty) || parseInt(qty) <= 0) return;
+    // 选供应商
+    var suppR = await fetchAPI(API + '/suppliers');
+    var supps = suppR.success ? suppR.data : [];
+    var suppList = supps.map(function(s,i) { return (i+1)+'. '+s.name; }).join('\n');
+    var suppInp = prompt('选择供应商（输编号或新名称）：\n' + (suppList || '暂无'));
+    if (suppInp === null) return;
+    var supplierId = null;
+    var idx = parseInt(suppInp) - 1;
+    if (!isNaN(idx) && supps[idx]) {
+        supplierId = supps[idx].id;
+    } else if (suppInp.trim()) {
+        var cr = await fetchAPI(API + '/suppliers', { method: 'POST', body: JSON.stringify({ name: suppInp.trim() }) });
+        if (cr.success) supplierId = cr.id;
+    }
+    // 进货价
+    var prod = currentProducts.find(function(p) { return p.id === productId; });
+    var ref = (prod && prod.unit_price > 0) ? '(上次进价: ' + prod.unit_price + ')' : '';
+    var priceInp = prompt('请输入 "' + name + '" 进货单价(元): ' + ref);
+    if (priceInp === null) return;
+    var unitPrice = parseFloat(priceInp) || 0;
+    doStockIn(productId, parseInt(qty), supplierId, unitPrice);
+}
+
+
+
+async function doStockIn(productId, quantity, supplierId, unitPrice) {
+    supplierId = supplierId || null;
+    unitPrice = unitPrice || 0;
+    var body = { product_id: productId, quantity: quantity, unit_price: unitPrice, operator: '管理员' };
+    if (supplierId) body.supplier_id = supplierId;
+    var result = await fetchAPI(API + '/inventory/stock-in', {
+        method: 'POST',
+        body: JSON.stringify(body),
+    });
+    if (result.success) {
+        showToast('入库成功', 'success');
+        loadProducts();
+        loadInventory();
+    } else {
+        showToast('入库失败: ' + result.error, 'error');
+    }
+}
+
+
+let _customersCache = null;
+
+async function quickStockOut(productId, name) {
+	    const qty = prompt('请输入 "' + name + '" 出库数量:');
+	    if (!qty || isNaN(qty) || parseInt(qty) <= 0) return;
+	    const prod = currentProducts.find(p => p.id === productId);
+	    const ref = (prod && prod.sale_price > 0) ? '(参考价: ' + prod.sale_price + ')' : '';
+	    const sp = prompt('请输入 "' + name + '" 出库单价(元): ' + ref);
+	    if (sp === null) return;
+	    const unitPrice = parseFloat(sp) || 0;
+	    if (!_customersCache) {
+	        const r = await fetchAPI('/api/customers');
+	        _customersCache = r.success ? r.data : [];
+	    }
+	    const list = _customersCache.map((c,i) => (i+1)+'. '+c.name).join('\n');
+	    const inp = prompt('选择客户（输编号或新名称）：\n' + (list || '暂无'));
+	    if (inp === null) return;
+	    let cid = null;
+	    const idx = parseInt(inp) - 1;
+	    if (!isNaN(idx) && _customersCache[idx]) {
+	        cid = _customersCache[idx].id;
+	    } else if (inp.trim()) {
+	        const cr = await fetchAPI('/api/customers', { method: 'POST', body: JSON.stringify({ name: inp.trim() }) });
+	        if (cr.success) { cid = cr.id; _customersCache = null; }
+	    }
+	    doStockOut(productId, parseInt(qty), cid, unitPrice);
+	}
+
+async function doStockOut(productId, quantity, customerId, unitPrice) {
+    customerId = customerId || null;
+    unitPrice = unitPrice || 0;
+    var body = { product_id: productId, quantity: quantity, unit_price: unitPrice, operator: '管理员' };
+    if (customerId) body.customer_id = customerId;
+    var result = await fetchAPI(API + '/inventory/stock-out', {
+        method: 'POST',
+        body: JSON.stringify(body),
+    });
+    if (result.success) {
+        showToast('出库成功', 'success');
+        loadProducts();
+        loadInventory();
+    } else {
+        showToast('出库失败: ' + result.error, 'error');
+    }
+}
+
+// ==========================================
+//  库存管理
+// ==========================================
+async function loadInventory() {
+    const result = await fetchAPI(`${API}/inventory`);
+    if (result.success) {
+        renderInventoryTable(result.data);
+    }
+}
+
+function renderInventoryTable(items) {
+    const tbody = $('#inventory-tbody');
+    if (!items || items.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="11" style="text-align:center;color:#94a3b8;padding:30px;">暂无库存数据</td></tr>';
+        return;
+    }
+    tbody.innerHTML = items.map(item => {
+        const isLow = item.quantity <= item.min_stock;
+        return `
+            <tr>
+                <td><strong>${item.product_name}</strong></td>
+                <td>${item.sku}</td>
+                <td>${item.category_name || '-'}</td>
+                <td>${item.supplier_name || '-'}</td>
+                <td style="font-weight:700;color:${isLow ? 'var(--danger)' : 'var(--text)'};">
+                    ${item.quantity.toLocaleString()}
+                </td>
+                <td>${item.min_stock}</td>
+                <td>${item.max_stock}</td>
+                <td>${item.location || '-'}</td>
+                <td>${(item.latest_price && item.latest_price > 0) ? '¥'+parseFloat(item.latest_price).toFixed(2) : '-'}</td>
+                <td>${(item.avg_price && item.avg_price > 0) ? '¥'+parseFloat(item.avg_price).toFixed(2) : '-'}</td>
+                <td>
+                    <button class="btn btn-outline btn-sm" onclick="showBatchDetail(${item.product_id},'${item.product_name}')">批次</button>
+                    <button class="btn btn-outline btn-sm" onclick="editInventory(${item.product_id},${item.quantity},'${item.location||''}',${item.min_stock},${item.max_stock})">调整</button>
+                </td>
+            </tr>
+        `;
+    }).join('');
+}
+
+async function showBatchDetail(pid, pname) {
+    var r = await fetchAPI(API + '/transactions?limit=500');
+    if (!r.success) return;
+    var batches = r.data.filter(function(t) { return t.product_id === pid && t.type === 'in'; });
+    var html = '<h3>' + pname + ' - 进货批次</h3><table style=\"width:100%;font-size:13px;\"><tr><th>时间</th><th>数量</th><th>进价</th><th>金额</th><th>供应商</th></tr>';
+    if (batches.length === 0) html += '<tr><td colspan=\"5\" style=\"text-align:center;\">暂无进货记录</td></tr>';
+    else batches.forEach(function(b) {
+        html += '<tr><td>' + formatDate(b.created_at) + '</td><td>+' + b.quantity + '</td><td>' + (b.unit_price > 0 ? '¥' + b.unit_price : '-') + '</td><td>' + (b.unit_price > 0 ? '¥' + (b.quantity * b.unit_price).toLocaleString() : '-') + '</td><td>' + (b.supplier_name || '-') + '</td></tr>';
+    });
+    html += '</table>';
+    var modal = document.createElement('div');
+    modal.className = 'modal-overlay active';
+    modal.onclick = function(e) { if (e.target === modal) modal.remove(); };
+    modal.innerHTML = '<div class="modal" style="max-width:700px;"><div class="modal-header"><h3>' + pname + ' - 进货批次</h3><button class="modal-close" id="batch-close-btn">✕</button></div><div class="modal-body">' + html + '</div></div>';
+    setTimeout(function() {
+        var btn = document.getElementById('batch-close-btn');
+        if (btn) btn.onclick = function() { modal.remove(); };
+    }, 10);
+    document.body.appendChild(modal);
+}
+
+function editInventory(productId, qty, loc, minS, maxS) {
+    const newQty = prompt('新库存数量:', qty);
+    if (newQty === null || isNaN(parseInt(newQty))) return;
+    const newLoc = prompt('库位:', loc);
+    const newMin = prompt('最低库存:', minS);
+    const newMax = prompt('最高库存:', maxS);
+    updateInventory(productId, parseInt(newQty), newLoc, parseInt(newMin), parseInt(newMax));
+}
+
+async function updateInventory(productId, quantity, location, minStock, maxStock) {
+    const result = await fetchAPI(`${API}/inventory/${productId}`, {
+        method: 'PUT',
+        body: JSON.stringify({ quantity, location, min_stock: minStock, max_stock: maxStock }),
+    });
+    if (result.success) {
+        showToast('库存更新成功', 'success');
+        loadInventory();
+    } else {
+        showToast('更新失败: ' + result.error, 'error');
+    }
+}
+
+// ==========================================
+//  交易记录
+// ==========================================
+async function loadTransactions() {
+    const result = await fetchAPI(`${API}/transactions?limit=200`);
+    if (result.success) {
+        renderTransactionsTable(result.data);
+    }
+}
+
+function renderTransactionsTable(items) {
+    const tbody = $('#txn-tbody');
+    if (!items || items.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="10" style="text-align:center;color:#94a3b8;padding:30px;">暂无交易记录</td></tr>';
+        return;
+    }
+        var txHtml = '';
+    for (var ti = 0; ti < items.length; ti++) {
+        var t = items[ti];
+        var priceStr = (t.unit_price && t.unit_price > 0) ? '¥' + t.unit_price : '-';
+        var totalStr = (t.unit_price && t.unit_price > 0) ? '¥' + (t.quantity * t.unit_price).toLocaleString() : '-';
+        txHtml += '<tr>' +
+            '<td>' + formatDate(t.created_at) + '</td>' +
+            '<td>' + t.product_name + '</td>' +
+            '<td><span class="badge ' + (t.type === 'in' ? 'badge-success' : 'badge-warning') + '">' + (t.type === 'in' ? '入库' : '出库') + '</span></td>' +
+            '<td>' + t.quantity + '</td>' +
+            '<td>' + t.before_qty + ' → ' + t.after_qty + '</td>' +
+            '<td>' + priceStr + '</td>' +
+            '<td>' + totalStr + '</td>' +
+            '<td>' + (t.customer_name || '-') + '</td>' +
+            '<td>' + (t.operator || '-') + '</td>' +
+            '<td>' + (t.notes || '-') + '</td></tr>';
+    }
+    tbody.innerHTML = txHtml || '<tr><td colspan="10" style="text-align:center;color:#94a3b8;padding:30px;">暂无交易记录</td></tr>';
+}
+
+// ==========================================
+//  Excel 上传
+// ==========================================
+async function loadUploads() {
+    const result = await fetchAPI(`${API}/uploads`);
+    if (result.success) {
+        renderUploadsTable(result.data);
+    }
+}
+
+function renderUploadsTable(items) {
+    const tbody = $('#uploads-tbody');
+    if (!items || items.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#94a3b8;padding:30px;">暂无上传记录</td></tr>';
+        return;
+    }
+    tbody.innerHTML = items.map(u => `
+        <tr>
+            <td>${u.filename}</td>
+            <td>${(u.file_size / 1024).toFixed(1)} KB</td>
+            <td><span class="badge badge-${u.status==='success'?'success':u.status==='failed'?'danger':'info'}">${u.status}</span></td>
+            <td>${u.rows_processed}</td>
+            <td>${formatDate(u.uploaded_at)}</td>
+        </tr>
+    `).join('');
+}
+
+// 拖拽上传
+const uploadZone = $('#upload-zone');
+if (uploadZone) {
+    uploadZone.addEventListener('click', () => $('#file-input').click());
+    uploadZone.addEventListener('dragover', (e) => { e.preventDefault(); uploadZone.classList.add('dragover'); });
+    uploadZone.addEventListener('dragleave', () => uploadZone.classList.remove('dragover'));
+    uploadZone.addEventListener('drop', (e) => {
+        e.preventDefault();
+        uploadZone.classList.remove('dragover');
+        const files = e.dataTransfer.files;
+        if (files.length > 0) uploadFile(files[0]);
+    });
+}
+
+$('#file-input')?.addEventListener('change', (e) => {
+    if (e.target.files.length > 0) uploadFile(e.target.files[0]);
+});
+
+function updateUploadHint() {
+    const isIncrement = $('#import-mode').checked;
+    const hint = $('#upload-hint');
+    const base = `<strong>📋 Excel 模板说明：</strong><br>
+        只需填写 <code>商品名称</code> 即可，SKU 和库位会自动生成<br>
+        可选列：<code>SKU</code> <code>分类</code> <code>单位</code> <code>规格</code> <code>数量</code> <code>库位</code> <code>最低库存</code> <code>最高库存</code> <code>描述</code><br>`;
+    if (isIncrement) {
+        hint.innerHTML = base + `<span style="color:#10b981;">当前模式：增量导入（Excel 中的数量将累加到现有库存）</span>`;
+    } else {
+        hint.innerHTML = base + `<span style="color:#3b82f6;">当前模式：全量覆盖（Excel 中的数量直接作为最终库存）</span>`;
+    }
+}
+
+async function uploadFile(file) {
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('mode', $('#import-mode').checked ? 'increment' : 'replace');
+
+    $('#upload-status').textContent = '正在上传和解析...';
+    $('#upload-status').style.color = '#3b82f6';
+
+    try {
+        const resp = await fetch(`${API}/upload`, { method: 'POST', body: formData });
+        const result = await resp.json();
+        if (result.success) {
+            $('#upload-status').textContent = `✅ 导入成功！处理 ${result.data.rows_imported} 条数据`;
+            $('#upload-status').style.color = '#10b981';
+            if (result.data.errors && result.data.errors.length > 0) {
+                showToast(`部分数据导入失败: ${result.data.errors.slice(0, 3).join('; ')}`, 'warning');
+            }
+            loadUploads();
+            // 刷新其他页面数据
+            loadDashboard();
+            loadProducts();
+            loadInventory();
+        } else {
+            $('#upload-status').textContent = `❌ ${result.error}`;
+            $('#upload-status').style.color = '#ef4444';
+        }
+    } catch (err) {
+        $('#upload-status').textContent = `❌ 网络错误: ${err.message}`;
+        $('#upload-status').style.color = '#ef4444';
+    }
+}
+
+// ==========================================
+//  AI 智能导入
+// ==========================================
+async function smartImport() {
+    const input = $('#smart-import-input');
+    const text = input.value.trim();
+    if (!text) { showToast('请描述采购信息', 'warning'); return; }
+
+    const status = $('#smart-import-status');
+    status.textContent = '🤖 AI 正在解析...';
+    status.style.color = '#3b82f6';
+    input.disabled = true;
+
+    const result = await fetchAPI(`${API}/ai/smart-import`, {
+        method: 'POST',
+        body: JSON.stringify({ text }),
+    });
+
+    input.disabled = false;
+    if (result.success) {
+        const d = result.data;
+        status.innerHTML = `✅ 成功导入 ${d.count} 条：${d.imported.map(i => `${i.name} +${i.quantity}`).join('，')}`;
+        status.style.color = '#10b981';
+        input.value = '';
+        // 刷新其他数据
+        loadProducts();
+        loadInventory();
+        loadTransactions();
+    } else {
+        status.textContent = '❌ ' + result.error;
+        status.style.color = '#ef4444';
+    }
+}
+
+// ==========================================
+//  AI 智能分析
+// ==========================================
+async function initAIPage() {
+    checkAIHealth();  // 仅检查健康状态
+}
+
+async function checkAIHealth() {
+    const status = $('#ai-status-indicator');
+    const text = $('#ai-status-text');
+    try {
+        const result = await fetchAPI(`${API}/ai/health`);
+        if (result.success) {
+            status.className = 'ai-status online';
+            text.textContent = 'AI 服务在线';
+        } else {
+            status.className = 'ai-status offline';
+            text.textContent = 'AI 服务离线';
+        }
+    } catch {
+        status.className = 'ai-status offline';
+        text.textContent = 'AI 服务离线';
+    }
+}
+
+async function runAIAnalysis(type) {
+    const container = $('#ai-result');
+    container.innerHTML = '<div style="text-align:center;padding:40px;color:#94a3b8;">🤖 AI 正在分析中，请稍候...</div>';
+
+    const result = await fetchAPI(`${API}/ai/analyze?type=${type}`);
+    if (result.success) {
+        container.innerHTML = `<div style="white-space:pre-wrap;line-height:1.8;font-size:14px;">${result.data}</div>`;
+    } else {
+        container.innerHTML = `<div style="color:var(--danger);">分析失败: ${result.error}</div>`;
+    }
+}
+
+async function sendAIChat() {
+    const input = $('#ai-chat-input');
+    const message = input.value.trim();
+    if (!message) return;
+
+    const messagesContainer = $('#ai-chat-messages');
+    // 添加用户消息
+    messagesContainer.innerHTML += `<div class="ai-chat-msg user">${message}</div>`;
+    input.value = '';
+    messagesContainer.scrollTop = messagesContainer.scrollHeight;
+
+    // 添加 ai 占位
+    const aiPlaceholder = document.createElement('div');
+    aiPlaceholder.className = 'ai-chat-msg assistant';
+    aiPlaceholder.textContent = '思考中...';
+    messagesContainer.appendChild(aiPlaceholder);
+    messagesContainer.scrollTop = messagesContainer.scrollHeight;
+
+    const result = await fetchAPI(`${API}/ai/chat`, {
+        method: 'POST',
+        body: JSON.stringify({ message }),
+    });
+
+    if (result.success) {
+        aiPlaceholder.textContent = result.data;
+    } else {
+        aiPlaceholder.textContent = '抱歉，分析出错: ' + result.error;
+    }
+    messagesContainer.scrollTop = messagesContainer.scrollHeight;
+}
+
+$('#ai-chat-input')?.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        sendAIChat();
+    }
+});
+
+// ==========================================
+//  初始化
+// ==========================================
+document.addEventListener('DOMContentLoaded', () => {
+    // Toast 容器
+    const toastContainer = document.createElement('div');
+    toastContainer.id = 'toast-container';
+    toastContainer.style.cssText = 'position:fixed;top:20px;right:20px;z-index:9999;max-width:400px;';
+    document.body.appendChild(toastContainer);
+
+    // 添加全局关闭模态框
+    document.addEventListener('click', (e) => {
+        if (e.target.classList.contains('modal-overlay')) {
+            e.target.classList.remove('active');
+        }
+    });
+
+    // 搜索栏事件
+    $('#product-search')?.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') loadProducts();
+    });
+
+    // 加载首页
+    navigateTo('dashboard');
+    checkAIHealth();
+});
+
+// ==========================================
+//  分类管理
+// ==========================================
+async function quickAddCategory() {
+    var inp = $('#category-quick-add');
+    var name = inp.value.trim();
+    if (!name) return;
+    var r = await fetchAPI(API + '/categories', { method: 'POST', body: JSON.stringify({ name: name }) });
+    if (r.success) { showToast('已添加', 'success'); inp.value = ''; loadCategories(); }
+    else showToast(r.error, 'error');
+}
+
+async function loadCategories() {
+    var r = await fetchAPI(API + '/categories');
+    if (r.success) {
+        var t = $('#categories-tbody');
+        t.innerHTML = r.data.map(function(c) {
+            return '<tr>' +
+                '<td contenteditable="true" onblur="updateCategoryField(' + c.id + ',\'name\',this.textContent)" style="font-weight:600;">' + c.name + '</td>' +
+                '<td contenteditable="true" onblur="updateCategoryField(' + c.id + ',\'description\',this.textContent)">' + (c.description || '-') + '</td>' +
+                '<td><button class="btn btn-danger btn-sm" onclick="deleteCategory(' + c.id + ')">删除</button></td>' +
+                '</tr>';
+        }).join('') || '<tr><td colspan="3" style="text-align:center;padding:30px;">暂无分类</td></tr>';
+    }
+}
+
+async function updateCategoryField(id, field, value) {
+    var r = await fetchAPI(API + '/categories');
+    if (!r.success) return;
+    var cat = r.data.find(function(x) { return x.id === id; });
+    if (!cat) return;
+    var data = { name: cat.name, description: cat.description || '' };
+    data[field] = value.trim();
+    await fetchAPI(API + '/categories/' + id, { method: 'PUT', body: JSON.stringify(data) });
+}
+
+async function deleteCategory(id) {
+    if (!confirm('确定删除？')) return;
+    var r = await fetchAPI(API + '/categories/' + id, { method: 'DELETE' });
+    if (r.success) { showToast('已删除', 'success'); loadCategories(); }
+    else showToast(r.error, 'error');
+}
+
+// ==========================================
+//  供应商管理
+// ==========================================
+let currentSuppliers = [];
+
+async function quickAddSupplier() {
+    const inp = $('#supplier-quick-add');
+    const name = inp.value.trim();
+    if (!name) return;
+    const r = await fetchAPI(`${API}/suppliers`, { method: 'POST', body: JSON.stringify({ name }) });
+    if (r.success) { showToast('供应商已添加', 'success'); inp.value = ''; loadSuppliers(); }
+    else showToast(r.error, 'error');
+}
+
+async function loadSuppliers() {
+    const r = await fetchAPI(`${API}/suppliers`);
+    if (r.success) {
+        currentSuppliers = r.data;
+        const t = $('#suppliers-tbody');
+        t.innerHTML = r.data.map(s => `
+            <tr>
+                <td contenteditable="true" onblur="updateSupplierField(${s.id},'name',this.textContent)" style="font-weight:600;">${s.name}</td>
+                <td contenteditable="true" onblur="updateSupplierField(${s.id},'contact_person',this.textContent)">${s.contact_person || '-'}</td>
+                <td contenteditable="true" onblur="updateSupplierField(${s.id},'phone',this.textContent)">${s.phone || '-'}</td>
+                <td><button class="btn btn-danger btn-sm" onclick="deleteSupplier(${s.id})">删除</button></td>
+            </tr>
+        `).join('') || '<tr><td colspan="4" style="text-align:center;padding:30px;">暂无供应商，在上方输入框添加</td></tr>';
+    }
+}
+
+async function updateSupplierField(id, field, value) {
+    const s = currentSuppliers.find(x => x.id === id);
+    if (!s) return;
+    const data = { name: s.name, contact_person: s.contact_person, phone: s.phone, email: s.email || '', address: s.address || '', notes: s.notes || '' };
+    data[field] = value.trim();
+    await fetchAPI(`${API}/suppliers/${id}`, { method: 'PUT', body: JSON.stringify(data) });
+}
+
+async function deleteSupplier(id) {
+    if (!confirm('确定删除？')) return;
+    await fetchAPI(`${API}/suppliers/${id}`, { method: 'DELETE' });
+    loadSuppliers();
+}
+
+async function loadSuppliersForSelect() {
+    const r = await fetchAPI(`${API}/suppliers`);
+    if (r.success) {
+        const sel = $('#product-supplier');
+        if (sel) sel.innerHTML = '<option value="">请选择供应商</option>' + r.data.map(s => `<option value="${s.id}">${s.name}</option>`).join('');
+    }
+}
+
+// ==========================================
+//  客户管理
+// ==========================================
+let currentCustomers = [];
+
+async function quickAddCustomer() {
+    const inp = $('#customer-quick-add');
+    const name = inp.value.trim();
+    if (!name) return;
+    const r = await fetchAPI(`${API}/customers`, { method: 'POST', body: JSON.stringify({ name }) });
+    if (r.success) { showToast('客户已添加', 'success'); inp.value = ''; loadCustomers(); }
+    else showToast(r.error, 'error');
+}
+
+async function loadCustomers() {
+    const r = await fetchAPI(`${API}/customers`);
+    if (r.success) {
+        currentCustomers = r.data;
+        const t = $('#customers-tbody');
+        t.innerHTML = r.data.map(c => `
+            <tr>
+                <td contenteditable="true" onblur="updateCustomerField(${c.id},'name',this.textContent)" style="font-weight:600;">${c.name}</td>
+                <td contenteditable="true" onblur="updateCustomerField(${c.id},'contact_person',this.textContent)">${c.contact_person || '-'}</td>
+                <td contenteditable="true" onblur="updateCustomerField(${c.id},'phone',this.textContent)">${c.phone || '-'}</td>
+                <td><button class="btn btn-danger btn-sm" onclick="deleteCustomer(${c.id})">删除</button></td>
+            </tr>
+        `).join('') || '<tr><td colspan="4" style="text-align:center;padding:30px;">暂无客户，在上方输入框添加</td></tr>';
+    }
+}
+
+async function updateCustomerField(id, field, value) {
+    const c = currentCustomers.find(x => x.id === id);
+    if (!c) return;
+    const data = { name: c.name, contact_person: c.contact_person, phone: c.phone, email: c.email || '', address: c.address || '', notes: c.notes || '' };
+    data[field] = value.trim();
+    await fetchAPI(`${API}/customers/${id}`, { method: 'PUT', body: JSON.stringify(data) });
+}
+
+async function deleteCustomer(id) {
+    if (!confirm('确定删除？')) return;
+    await fetchAPI(`${API}/customers/${id}`, { method: 'DELETE' });
+    loadCustomers();
+}
+
+// ==========================================
+//  供应商/客户 Excel 导入
+// ==========================================
+// ==========================================
+//  出库单
+// ==========================================
+var orderItems = [];
+
+async function loadOrderPage() {
+    var cr = await fetchAPI(API + '/customers');
+    window._orderCustomers = cr.success ? cr.data : [];
+    var pr = await fetchAPI(API + '/products');
+    window._orderProducts = pr.success ? pr.data : [];
+}
+
+var _customerDropdownData = [];
+var _productDropdownData = [];
+
+function searchCustomer() {
+    var kw = (document.getElementById('order-customer-input').value || '').trim().toLowerCase();
+    var dd = document.getElementById('customer-dropdown');
+    var list = (window._orderCustomers || []).filter(function(c) { return !kw || c.name.toLowerCase().indexOf(kw) >= 0; }).slice(0, 15);
+    _customerDropdownData = list;
+    if (list.length === 0) { dd.style.display = 'none'; return; }
+    dd.style.display = 'block';
+    dd.innerHTML = list.map(function(c, i) {
+        return '<div style="padding:6px 10px;cursor:pointer;" data-idx="' + i + '">' + c.name + '</div>';
+    }).join('');
+}
+
+function searchProduct() {
+    var kw = (document.getElementById('order-product-input').value || '').trim().toLowerCase();
+    var dd = document.getElementById('product-dropdown');
+    var list = (window._orderProducts || []).filter(function(p) { return !kw || p.name.toLowerCase().indexOf(kw) >= 0 || p.sku.toLowerCase().indexOf(kw) >= 0; }).slice(0, 20);
+    _productDropdownData = list;
+    if (list.length === 0) { dd.style.display = 'none'; return; }
+    dd.style.display = 'block';
+    dd.innerHTML = list.map(function(p, i) {
+        var price = p.sale_price > 0 ? ' ¥' + p.sale_price : '';
+        return '<div style="padding:6px 10px;cursor:pointer;" data-idx="' + i + '">' + p.name + ' <span style="color:#94a3b8;">' + p.sku + '</span>' + price + '</div>';
+    }).join('');
+}
+
+// 下拉点击事件委托（用 document 避免元素未渲染）
+document.addEventListener('mousedown', function(e) {
+    var div = e.target.closest('#customer-dropdown [data-idx]');
+    if (div) {
+        e.preventDefault();
+        var c = _customerDropdownData[parseInt(div.getAttribute('data-idx'))];
+        if (c) {
+            document.getElementById('order-customer').value = c.id;
+            document.getElementById('order-customer-input').value = c.name;
+            document.getElementById('customer-dropdown').style.display = 'none';
+        }
+    }
+    div = e.target.closest('#product-dropdown [data-idx]');
+    if (div) {
+        e.preventDefault();
+        var p = _productDropdownData[parseInt(div.getAttribute('data-idx'))];
+        if (p) {
+            document.getElementById('order-product-select').value = p.id;
+            document.getElementById('order-product-input').value = p.name;
+            document.getElementById('order-product-price').value = p.sale_price || 0;
+            document.getElementById('product-dropdown').style.display = 'none';
+        }
+    }
+});
+
+// 点击空白关闭下拉
+document.addEventListener('click', function(e) {
+    var cd = document.getElementById('customer-dropdown');
+    var pd = document.getElementById('product-dropdown');
+    if (cd && e.target !== document.getElementById('order-customer-input')) cd.style.display = 'none';
+    if (pd && e.target !== document.getElementById('order-product-input')) pd.style.display = 'none';
+});
+
+function addOrderItem() {
+    var pid = parseInt(document.getElementById('order-product-select').value);
+    var qty = parseInt(document.getElementById('order-product-qty').value) || 1;
+    var price = parseFloat(document.getElementById('order-product-price').value);
+    if (!pid) { showToast('请选择商品', 'warning'); return; }
+    var prod = window._orderProducts.find(function(p) { return p.id === pid; });
+    if (!prod) return;
+    // 售价默认用商品已有售价
+    if (isNaN(price) || price <= 0) price = prod.sale_price || 0;
+    var existing = orderItems.find(function(i) { return i.product_id === pid; });
+    if (existing) { existing.quantity += qty; if (price > 0) existing.sale_price = price; }
+    else {
+        orderItems.push({
+            product_id: pid,
+            name: prod.name,
+            sku: prod.sku,
+            unit: prod.unit,
+            specification: prod.specification || '',
+            sale_price: price,
+            quantity: qty,
+        });
+    }
+    document.getElementById('order-product-input').value = '';
+    document.getElementById('order-product-qty').value = '1';
+    document.getElementById('order-product-price').value = '0';
+    renderOrderItems();
+}
+
+function removeOrderItem(index) {
+    orderItems.splice(index, 1);
+    renderOrderItems();
+}
+
+function resetOrder() {
+    orderItems = [];
+    renderOrderItems();
+}
+
+function renderOrderItems() {
+    var tbody = document.getElementById('order-items-tbody');
+    var total = 0;
+    if (orderItems.length === 0) {
+        tbody.innerHTML = '<tr><td colspan=\"6\" style=\"text-align:center;padding:30px;\">请先添加商品</td></tr>';
+    } else {
+        tbody.innerHTML = orderItems.map(function(item, i) {
+            var sub = item.sale_price * item.quantity;
+            total += sub;
+            return '<tr><td><strong>' + item.name + '</strong><br><small>' + item.specification + '</small></td>' +
+                '<td>' + item.sku + '</td>' +
+                '<td><input type=\"number\" value=\"' + item.quantity + '\" min=\"1\" onchange=\"updateOrderQty(' + i + ',this.value)\" style=\"width:60px;\"></td>' +
+                '<td><input type=\"number\" value=\"' + item.sale_price + '\" step=\"0.01\" min=\"0\" onchange=\"updateOrderPrice(' + i + ',this.value)\" style=\"width:80px;\"></td>' +
+                '<td>' + (item.sale_price > 0 ? '¥' + sub.toLocaleString() : '-') + '</td>' +
+                '<td><button class=\"btn btn-danger btn-sm\" onclick=\"removeOrderItem(' + i + ')\">✕</button></td></tr>';
+        }).join('');
+    }
+    document.getElementById('order-total').textContent = '合计: ¥' + total.toLocaleString();
+}
+
+function updateOrderQty(index, val) {
+    var qty = parseInt(val) || 1;
+    orderItems[index].quantity = qty;
+    renderOrderItems();
+}
+
+function updateOrderPrice(index, val) {
+    var price = parseFloat(val) || 0;
+    orderItems[index].sale_price = price;
+    renderOrderItems();
+}
+
+async function submitAndDownload() {
+    var cid = document.getElementById('order-customer').value;
+    var custName = document.getElementById('order-customer-input').value.trim();
+    var operator = document.getElementById('order-operator').value.trim();
+    if (!cid) { showToast('请选择客户', 'warning'); return; }
+    if (!operator) { showToast('请填写经办人', 'warning'); return; }
+    if (orderItems.length === 0) { showToast('请添加商品', 'warning'); return; }
+
+    // 提交出库
+    var ok = true;
+    for (var i = 0; i < orderItems.length; i++) {
+        var item = orderItems[i];
+        var body = { product_id: item.product_id, quantity: item.quantity, customer_id: parseInt(cid), operator: operator, unit_price: item.sale_price };
+        var r = await fetchAPI(API + '/inventory/stock-out', { method: 'POST', body: JSON.stringify(body) });
+        if (!r.success) { showToast(item.name + ' 出库失败: ' + r.error, 'error'); ok = false; }
+    }
+    if (!ok) return;
+    showToast('出库成功', 'success');
+    loadProducts(); loadInventory(); loadTransactions();
+
+    // 生成下载文件
+    downloadOrder();
+    // 清空
+    resetOrder();
+}
+
+function downloadOrder() {
+    var custName = document.getElementById('order-customer-input').value.trim();
+    var operator = document.getElementById('order-operator').value.trim();
+
+    var data = {
+        items: orderItems,
+        customer: custName,
+        operator: operator,
+        keeper: document.getElementById('order-keeper').value.trim(),
+        warehouse: document.getElementById('order-warehouse').value.trim(),
+    };
+
+    fetch(API + '/order/export', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data),
+    }).then(function(resp) {
+        if (!resp.ok) throw new Error('导出失败');
+        return resp.blob();
+    }).then(function(blob) {
+        var a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = '出库单_' + (custName || 'unknown') + '_' + new Date().toISOString().substring(0,10) + '.xlsx';
+        a.click();
+    }).catch(function(e) {
+        showToast('导出失败: ' + e.message, 'error');
+    });
+}
+
+// ==========================================
+//  导出库存单
+// ==========================================
+function exportInventory() {
+    fetch(API + '/inventory').then(function(r) { return r.json(); }).then(function(data) {
+        if (!data.success) return;
+        fetch(API + '/order/export-inventory', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ items: data.data }),
+        }).then(function(r) { return r.blob(); }).then(function(b) {
+            var a = document.createElement('a'); a.href = URL.createObjectURL(b);
+            a.download = '库存清单_' + new Date().toISOString().substring(0,10) + '.xlsx'; a.click();
+        });
+    });
+}
+
+async function uploadSupplierExcel(file) {
+    const fd = new FormData(); fd.append('file', file);
+    try {
+        const resp = await fetch(`${API}/upload/suppliers`, { method: 'POST', body: fd });
+        const r = await resp.json();
+        if (r.success) { showToast(`成功导入 ${r.data.rows_imported} 个供应商`, 'success'); loadSuppliers(); }
+        else showToast('导入失败: ' + r.error, 'error');
+    } catch(e) { showToast('网络错误', 'error'); }
+}
+
+// ==========================================
+//  操作日志
+// ==========================================
+async function loadAuditLog(table) {
+    table = table || '';
+    const r = await fetchAPI(API + '/audit-log?limit=200' + (table ? '&table=' + table : ''));
+    if (r.success) {
+        var labels = { create: '创建', update: '更新', delete: '删除', stock_in: '入库', stock_out: '出库' };
+        var t = document.getElementById('audit-log-tbody');
+        var html = '';
+        for (var i = 0; i < r.data.length; i++) {
+            var l = r.data[i];
+            var badge = 'badge-warning';
+            if (l.action.indexOf('delete') >= 0) badge = 'badge-danger';
+            else if (l.action.indexOf('create') >= 0 || l.action.indexOf('stock_in') >= 0) badge = 'badge-success';
+            var oldStr = (l.old_data || '-');
+            if (oldStr.length > 80) oldStr = oldStr.substring(0, 80);
+            var newStr = (l.new_data || '-');
+            if (newStr.length > 80) newStr = newStr.substring(0, 80);
+            html += '<tr>' +
+                '<td>' + formatDate(l.created_at) + '</td>' +
+                '<td><span class="badge ' + badge + '">' + (labels[l.action] || l.action) + '</span></td>' +
+                '<td>' + l.table_name + '</td>' +
+                '<td>' + (l.record_id || '-') + '</td>' +
+                '<td>' + oldStr + '</td>' +
+                '<td>' + newStr + '</td>' +
+                '<td>' + (l.operator || '-') + '</td>' +
+                '</tr>';
+        }
+        t.innerHTML = html || '<tr><td colspan="7" style="text-align:center;padding:30px;">暂无日志</td></tr>';
+    }
+}
+
+async function uploadCustomerExcel(file) {
+    const fd = new FormData(); fd.append('file', file);
+    try {
+        const resp = await fetch(`${API}/upload/customers`, { method: 'POST', body: fd });
+        const r = await resp.json();
+        if (r.success) { showToast(`成功导入 ${r.data.rows_imported} 个客户`, 'success'); loadCustomers(); }
+        else showToast('导入失败: ' + r.error, 'error');
+    } catch(e) { showToast('网络错误', 'error'); }
+}

@@ -1,0 +1,564 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>仓库管理系统</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+
+<!-- ================================
+     侧边栏
+     ================================ -->
+<aside class="sidebar">
+    <div class="sidebar-header">
+        <h1>📦 仓库管理系统</h1>
+        <div class="subtitle">Inventory Management</div>
+    </div>
+    <nav class="sidebar-nav">
+        <div class="nav-item active" data-page="dashboard">
+            <span class="icon">📊</span> <span>仪表盘</span>
+        </div>
+        <div class="nav-item" data-page="products">
+            <span class="icon">📦</span> <span>商品管理</span>
+        </div>
+        <div class="nav-item" data-page="inventory">
+            <span class="icon">📋</span> <span>库存管理</span>
+        </div>
+        <div class="nav-item" data-page="categories">
+            <span class="icon">📂</span> <span>分类管理</span>
+        </div>
+        <div class="nav-item" data-page="suppliers">
+            <span class="icon">🏭</span> <span>供应商</span>
+        </div>
+        <div class="nav-item" data-page="customers">
+            <span class="icon">👥</span> <span>客户</span>
+        </div>
+        <div class="nav-item" data-page="order">
+            <span class="icon">🧾</span> <span>出库单</span>
+        </div>
+        <div class="nav-item" data-page="transactions">
+            <span class="icon">📝</span> <span>出入库记录</span>
+        </div>
+        <div class="nav-item" data-page="logs">
+            <span class="icon">📜</span> <span>操作日志</span>
+        </div>
+        <div class="nav-item" data-page="upload">
+            <span class="icon">📤</span> <span>数据导入</span>
+        </div>
+        <div class="nav-item" data-page="ai">
+            <span class="icon">🤖</span> <span>AI 智能分析</span>
+        </div>
+    </nav>
+    <div class="sidebar-footer">
+        AI 模型: qwen3.6-35b-a3b<br>
+        服务器: 100.101.108.100
+    </div>
+</aside>
+
+<!-- ================================
+     主内容区
+     ================================ -->
+<div class="main-content">
+    <!-- 顶部栏 -->
+    <div class="topbar">
+        <h2 id="page-title">仪表盘</h2>
+        <div class="topbar-actions">
+            <div class="ai-status online" id="ai-status-indicator">
+                <span class="dot"></span>
+                <span id="ai-status-text">检查中...</span>
+            </div>
+        </div>
+    </div>
+
+    <div class="content">
+
+        <!-- ==================== 仪表盘 ==================== -->
+        <div class="page active" id="page-dashboard">
+            <!-- 概览卡片 -->
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-icon blue">📦</div>
+                    <div class="stat-info">
+                        <div class="stat-label">商品总数</div>
+                        <div class="stat-value" id="stat-products">-</div>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon purple">📂</div>
+                    <div class="stat-info">
+                        <div class="stat-label">商品分类</div>
+                        <div class="stat-value" id="stat-categories">-</div>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon green">📊</div>
+                    <div class="stat-info">
+                        <div class="stat-label">库存总量</div>
+                        <div class="stat-value" id="stat-quantity">-</div>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon red">⚠️</div>
+                    <div class="stat-info">
+                        <div class="stat-label">低库存预警</div>
+                        <div class="stat-value" id="stat-lowstock">-</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 分类分布 -->
+            <div class="card">
+                <div class="card-header"><h3>📊 分类库存分布</h3></div>
+                <div id="category-chart" style="overflow-x:auto;"></div>
+            </div>
+
+            <!-- 低库存预警 + 最近交易 -->
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;">
+                <div class="card">
+                    <div class="card-header">
+                        <h3>⚠️ 低库存预警</h3>
+                        <a href="#" onclick="navigateTo('inventory');return false;" style="font-size:13px;color:var(--primary);">查看全部 →</a>
+                    </div>
+                    <div class="table-container">
+                        <table>
+                            <thead>
+                                <tr><th>商品</th><th>SKU</th><th>库存</th><th>最低库存</th><th>库位</th></tr>
+                            </thead>
+                            <tbody id="low-stock-tbody"></tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <h3>📝 最近交易</h3>
+                        <a href="#" onclick="navigateTo('transactions');return false;" style="font-size:13px;color:var(--primary);">查看全部 →</a>
+                    </div>
+                    <div class="table-container">
+                        <table>
+                            <thead>
+                                <tr><th>商品</th><th>类型</th><th>数量</th><th>时间</th></tr>
+                            </thead>
+                            <tbody id="recent-txn-tbody"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- ==================== 商品管理 ==================== -->
+        <div class="page" id="page-products">
+            <div class="card">
+                <div class="card-header">
+                    <h3>📦 商品列表</h3>
+                    <button class="btn btn-primary" onclick="showProductModal()">+ 新增商品</button>
+                </div>
+                <div class="search-bar">
+                    <input type="text" class="form-input" id="product-search" placeholder="搜索商品名称或 SKU...">
+                    <button class="btn btn-primary" onclick="loadProducts()">🔍 搜索</button>
+                </div>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>商品名称</th><th>SKU</th><th>分类</th><th>供应商</th><th>单位</th>
+                                <th>规格</th><th>库存</th><th>库位</th><th>操作</th>
+                            </tr>
+                        </thead>
+                        <tbody id="products-tbody"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- ==================== 库存管理 ==================== -->
+        <div class="page" id="page-inventory">
+            <div class="card">
+                <div class="card-header">
+                    <h3>📋 库存明细</h3>
+                    <button class="btn btn-outline btn-sm" onclick="exportInventory()">📥 导出库存单</button>
+                </div>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>商品名称</th><th>SKU</th><th>分类</th><th>供应商</th>
+                                <th>当前库存</th><th>最低库存</th><th>最高库存</th>
+                                <th>库位</th><th>最近进价</th><th>平均进价</th><th>操作</th>
+                            </tr>
+                        </thead>
+                        <tbody id="inventory-tbody"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- ==================== 分类管理 ==================== -->
+        <div class="page" id="page-categories">
+            <div class="card">
+                <div class="card-header">
+                    <h3>📂 分类管理</h3>
+                    <div class="btn-group">
+                        <input type="text" class="form-input" id="category-quick-add" placeholder="输入名称快速添加..." style="width:200px;" onkeydown="if(event.key==='Enter')quickAddCategory()">
+                        <button class="btn btn-primary btn-sm" onclick="quickAddCategory()">添加</button>
+                    </div>
+                </div>
+                <div class="table-container">
+                    <table>
+                        <thead><tr><th>名称</th><th>描述</th><th>操作</th></tr></thead>
+                        <tbody id="categories-tbody"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- ==================== 供应商管理 ==================== -->
+        <div class="page" id="page-suppliers">
+            <div class="card">
+                <div class="card-header">
+                    <h3>🏭 供应商管理</h3>
+                    <div class="btn-group">
+                        <input type="text" class="form-input" id="supplier-quick-add" placeholder="输入名称快速添加..." style="width:200px;" onkeydown="if(event.key==='Enter')quickAddSupplier()">
+                        <button class="btn btn-primary btn-sm" onclick="quickAddSupplier()">添加</button>
+                        <button class="btn btn-outline btn-sm" onclick="document.getElementById('supplier-file-input').click()">📤 Excel导入</button>
+                        <input type="file" id="supplier-file-input" accept=".xlsx,.xls,.csv" style="display:none;" onchange="uploadSupplierExcel(this.files[0])">
+                    </div>
+                </div>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr><th>名称</th><th>联系人</th><th>电话</th><th>操作</th></tr>
+                        </thead>
+                        <tbody id="suppliers-tbody"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- ==================== 客户管理 ==================== -->
+        <div class="page" id="page-customers">
+            <div class="card">
+                <div class="card-header">
+                    <h3>👥 客户管理</h3>
+                    <div class="btn-group">
+                        <input type="text" class="form-input" id="customer-quick-add" placeholder="输入名称快速添加..." style="width:200px;" onkeydown="if(event.key==='Enter')quickAddCustomer()">
+                        <button class="btn btn-primary btn-sm" onclick="quickAddCustomer()">添加</button>
+                        <button class="btn btn-outline btn-sm" onclick="document.getElementById('customer-file-input').click()">📤 Excel导入</button>
+                        <input type="file" id="customer-file-input" accept=".xlsx,.xls,.csv" style="display:none;" onchange="uploadCustomerExcel(this.files[0])">
+                    </div>
+                </div>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr><th>名称</th><th>联系人</th><th>电话</th><th>操作</th></tr>
+                        </thead>
+                        <tbody id="customers-tbody"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- ==================== 出库单 ==================== -->
+        <div class="page" id="page-order">
+            <div class="card">
+                <div class="card-header"><h3>🧾 创建出库单</h3></div>
+                <!-- 客户搜索 -->
+                <div class="form-row">
+                    <div class="form-group" style="position:relative;">
+                        <label>客户 *</label>
+                        <input type="text" class="form-input" id="order-customer-input" placeholder="输入客户名称搜索..."
+                               autocomplete="off" oninput="searchCustomer()" onfocus="searchCustomer()">
+                        <input type="hidden" id="order-customer">
+                        <div id="customer-dropdown" style="display:none;position:absolute;top:72px;left:0;right:0;max-height:200px;overflow:auto;background:#fff;border:1px solid #e2e8f0;border-radius:6px;box-shadow:0 2px 8px rgba(0,0,0,0.1);z-index:100;font-size:13px;"></div>
+                    </div>
+                </div>
+                <!-- 商品搜索 -->
+                <div class="form-row" style="margin-bottom:12px;">
+                    <div class="form-group" style="position:relative;">
+                        <label>商品</label>
+                        <input type="text" class="form-input" id="order-product-input" placeholder="输入商品名称搜索..."
+                               autocomplete="off" oninput="searchProduct()" onfocus="searchProduct()">
+                        <input type="hidden" id="order-product-select">
+                        <div id="product-dropdown" style="display:none;position:absolute;top:72px;left:0;right:0;max-height:250px;overflow:auto;background:#fff;border:1px solid #e2e8f0;border-radius:6px;box-shadow:0 2px 8px rgba(0,0,0,0.1);z-index:100;font-size:13px;"></div>
+                    </div>
+                    <div class="form-group">
+                        <label>数量</label>
+                        <input type="number" class="form-input" id="order-product-qty" value="1" min="1" style="width:100px;">
+                    </div>
+                    <div class="form-group">
+                        <label>售价(元)</label>
+                        <input type="number" class="form-input" id="order-product-price" value="0" step="0.01" style="width:100px;">
+                    </div>
+                    <div class="form-group">
+                        <label>&nbsp;</label>
+                        <button class="btn btn-primary btn-sm" onclick="addOrderItem()">+ 添加</button>
+                    </div>
+                </div>
+                <!-- 商品列表 -->
+                <div class="table-container">
+                    <table>
+                        <thead><tr><th>商品</th><th>SKU</th><th>数量</th><th>单价</th><th>小计</th><th>操作</th></tr></thead>
+                        <tbody id="order-items-tbody">
+                            <tr><td colspan="6" style="text-align:center;padding:30px;">请先添加商品</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+                <div style="text-align:right;margin-top:8px;font-weight:700;font-size:15px;" id="order-total">合计: ¥0.00</div>
+                <!-- 经办人、库管、仓库编号 -->
+                <div class="form-row" style="margin-top:16px;">
+                    <div class="form-group">
+                        <label>经办人 *</label>
+                        <input type="text" class="form-input" id="order-operator" placeholder="经办人姓名">
+                    </div>
+                    <div class="form-group">
+                        <label>库管</label>
+                        <input type="text" class="form-input" id="order-keeper" placeholder="库管姓名">
+                    </div>
+                    <div class="form-group">
+                        <label>仓库编号</label>
+                        <input type="text" class="form-input" id="order-warehouse" placeholder="如: WH-A01">
+                    </div>
+                </div>
+                <!-- 按钮 -->
+                <div style="margin-top:12px;display:flex;gap:8px;justify-content:flex-end;">
+                    <button class="btn btn-outline" onclick="resetOrder()">清空</button>
+                    <button class="btn btn-success" onclick="submitAndDownload()">📥 提交并下载出库单</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- ==================== 出入库记录 ==================== -->
+        <div class="page" id="page-transactions">
+            <div class="card">
+                <div class="card-header">
+                    <h3>📝 出入库记录</h3>
+                </div>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>时间</th><th>商品</th><th>类型</th><th>数量</th>
+                                <th>库存变化</th><th>单价</th><th>金额</th><th>客户</th><th>操作人</th><th>备注</th>
+                            </tr>
+                        </thead>
+                        <tbody id="txn-tbody"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- ==================== 操作日志 ==================== -->
+        <div class="page" id="page-logs">
+            <div class="card">
+                <div class="card-header">
+                    <h3>📜 操作日志</h3>
+                    <select class="form-select" style="width:auto;" onchange="loadAuditLog(this.value)">
+                        <option value="">全部</option>
+                        <option value="products">商品</option>
+                        <option value="inventory">库存</option>
+                        <option value="suppliers">供应商</option>
+                        <option value="customers">客户</option>
+                    </select>
+                </div>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr><th>时间</th><th>操作</th><th>对象</th><th>ID</th><th>旧数据</th><th>新数据</th><th>操作人</th></tr>
+                        </thead>
+                        <tbody id="audit-log-tbody"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- ==================== 数据导入 ==================== -->
+        <div class="page" id="page-upload">
+            <!-- AI 智能导入 -->
+            <div class="card">
+                <div class="card-header"><h3>🤖 AI 智能导入</h3></div>
+                <p style="font-size:13px;color:#64748b;margin-bottom:12px;">
+                    直接描述你采购了什么，AI 自动解析并导入。例如：「今天买了 50 盒 M6 螺丝，30 包 A4 打印纸，200 个 LED 灯珠」
+                </p>
+                <div style="display:flex;gap:8px;">
+                    <textarea class="form-textarea" id="smart-import-input"
+                              placeholder="描述你的采购信息..."
+                              style="flex:1;min-height:60px;"></textarea>
+                    <button class="btn btn-primary" onclick="smartImport()" style="height:60px;width:100px;">
+                        🤖 智能导入
+                    </button>
+                </div>
+                <div id="smart-import-status" style="margin-top:12px;font-size:14px;"></div>
+            </div>
+
+            <!-- Excel 导入 -->
+            <div class="card">
+                <div class="card-header"><h3>📤 Excel 数据导入</h3></div>
+
+                <div class="upload-zone" id="upload-zone">
+                    <div class="icon">📁</div>
+                    <div class="text">点击上传或拖拽 Excel 文件到此处</div>
+                    <div class="hint">支持 .xlsx / .xls / .csv 格式，最大 50MB</div>
+                </div>
+                <input type="file" id="file-input" accept=".xlsx,.xls,.csv" style="display:none;">
+                <div style="display:flex;align-items:center;gap:16px;margin-top:12px;">
+                    <div id="upload-status" style="font-size:14px;flex:1;"></div>
+                    <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:13px;">
+                        <input type="checkbox" id="import-mode" checked onchange="updateUploadHint()">
+                        <span>增量导入（数量累加到现有库存）</span>
+                    </label>
+                </div>
+
+                <div id="upload-hint" style="margin-top:12px;padding:16px;background:#f8fafc;border-radius:8px;font-size:13px;color:#64748b;">
+                    <strong>📋 Excel 模板说明：</strong><br>
+                    只需填写 <code>商品名称</code> 即可，SKU 和库位会自动生成<br>
+                    可选列：<code>SKU</code> <code>分类</code> <code>单位</code> <code>规格</code> <code>数量</code> <code>库位</code> <code>最低库存</code> <code>最高库存</code> <code>描述</code><br>
+                    <span style="color:#10b981;">当前模式：增量导入（Excel 中的数量将累加到现有库存）</span>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header"><h3>📋 上传记录</h3></div>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr><th>文件名</th><th>大小</th><th>状态</th><th>导入行数</th><th>上传时间</th></tr>
+                        </thead>
+                        <tbody id="uploads-tbody"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- ==================== AI 智能分析 ==================== -->
+        <div class="page" id="page-ai">
+            <!-- 分析类型选择 -->
+            <div class="card">
+                <div class="card-header"><h3>🤖 AI 库存分析</h3></div>
+                <div class="ai-preset-btns">
+                    <button class="btn btn-primary" onclick="runAIAnalysis('general')">📊 综合分析</button>
+                    <button class="btn btn-warning" onclick="runAIAnalysis('low_stock')">⚠️ 低库存预警</button>
+                    <button class="btn btn-success" onclick="runAIAnalysis('restock')">📦 补货建议</button>
+                    <button class="btn btn-info" onclick="runAIAnalysis('trend')">📈 趋势分析</button>
+                </div>
+                <div id="ai-result" style="min-height:100px;color:#94a3b8;text-align:center;padding:40px;">
+                    点击上方按钮，AI 将根据当前库存数据进行分析
+                </div>
+            </div>
+
+            <!-- AI 对话 -->
+            <div class="card">
+                <div class="card-header"><h3>💬 AI 对话</h3></div>
+                <div class="ai-chat-container">
+                    <div class="ai-chat-messages" id="ai-chat-messages">
+                        <div class="ai-chat-msg assistant">
+                            你好！我是仓库库存分析助手 🤖<br>
+                            我可以帮你分析库存数据、发现潜在风险、给出补货建议。<br>
+                            试试问我：「当前哪些商品需要补货？」或「库存有什么风险？」
+                        </div>
+                    </div>
+                    <div class="ai-chat-input">
+                        <input type="text" class="form-input" id="ai-chat-input"
+                               placeholder="输入你的问题，如：当前库存有什么风险？">
+                        <button class="btn btn-primary" onclick="sendAIChat()">发送</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+    </div><!-- /content -->
+</div><!-- /main-content -->
+
+<!-- ================================
+     商品编辑模态框
+     ================================ -->
+<div class="modal-overlay" id="product-modal">
+    <div class="modal">
+        <div class="modal-header">
+            <h3 id="product-modal-title">新增商品</h3>
+            <button class="modal-close" onclick="hideProductModal()">✕</button>
+        </div>
+        <div class="modal-body">
+            <form id="product-form">
+                <input type="hidden" id="product-id">
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>商品名称 *</label>
+                        <input type="text" class="form-input" id="product-name" required>
+                    </div>
+                    <div class="form-group">
+                        <label>SKU 编码 *</label>
+                        <input type="text" class="form-input" id="product-sku" required>
+                    </div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>分类</label>
+                        <select class="form-select" id="product-category">
+                            <option value="">请选择分类</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>供应商</label>
+                        <select class="form-select" id="product-supplier">
+                            <option value="">请选择供应商</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>单位</label>
+                        <input type="text" class="form-input" id="product-unit" value="个">
+                    </div>
+                <div class="form-group">
+                    <label>规格</label>
+                    <input type="text" class="form-input" id="product-spec">
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>进货单价(元)</label>
+                        <input type="number" step="0.01" class="form-input" id="product-unit-price" value="0">
+                    </div>
+                    <div class="form-group">
+                        <label>售价(元)</label>
+                        <input type="number" step="0.01" class="form-input" id="product-sale-price" value="0">
+                    </div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>库位</label>
+                        <input type="text" class="form-input" id="product-location">
+                    </div>
+                    <div class="form-group">
+                        <label>当前库存</label>
+                        <input type="number" class="form-input" id="product-quantity">
+                    </div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>最低库存</label>
+                        <input type="number" class="form-input" id="product-min-stock" value="0">
+                    </div>
+                    <div class="form-group">
+                        <label>最高库存</label>
+                        <input type="number" class="form-input" id="product-max-stock" value="9999">
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label>描述</label>
+                    <textarea class="form-textarea" id="product-desc"></textarea>
+                </div>
+            </form>
+        </div>
+        <div class="modal-footer">
+            <button class="btn btn-outline" onclick="hideProductModal()">取消</button>
+            <button class="btn btn-primary" onclick="saveProduct()">保存</button>
+        </div>
+    </div>
+</div>
+
+
+<script src="/static/js/app.js"></script>
+</body>
+</html>

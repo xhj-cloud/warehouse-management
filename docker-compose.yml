@@ -1,0 +1,51 @@
+# ============================================
+#  仓库管理系统 - Docker Compose 配置
+#  使用方式: docker compose up -d
+# ============================================
+
+version: '3.8'
+
+services:
+  # MySQL 数据库
+  mysql:
+    image: mysql:8.0
+    container_name: warehouse-mysql
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: root123
+      MYSQL_DATABASE: warehouse_db
+      MYSQL_USER: warehouse
+      MYSQL_PASSWORD: warehouse123
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./init_db.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      timeout: 20s
+      retries: 10
+
+  # Flask 应用
+  app:
+    build: .
+    container_name: warehouse-app
+    restart: always
+    ports:
+      - "5050:5050"
+    environment:
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_USER: warehouse
+      DB_PASSWORD: warehouse123
+      DB_NAME: warehouse_db
+      LM_STUDIO_URL: http://100.101.108.100:1234/v1
+      LM_STUDIO_MODEL: qwen3.6-35b-a3b
+    volumes:
+      - ./uploads:/app/uploads
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+volumes:
+  mysql-data:
