@@ -287,6 +287,8 @@ def api_inbound_recognize():
             imported.append({'name': name, 'sku': sku, 'quantity': qty, 'unit_price': up})
 
         return jsonify({'success': True, 'data': {'items': items, 'imported': imported, 'count': len(imported)}})
+    except RuntimeError as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
     except json.JSONDecodeError:
         return jsonify({'success': False, 'error': 'AI 识别结果解析失败，请重试或使用更清晰的图片'}), 400
     except Exception as e:

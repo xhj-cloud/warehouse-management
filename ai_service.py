@@ -274,9 +274,13 @@ class AIService:
             data = resp.json()
             return data['choices'][0]['message']['content']
         except requests.exceptions.Timeout:
-            return '[]'
+            raise RuntimeError("AI 视觉识别超时，请检查 LM Studio 模型是否已加载")
+        except requests.exceptions.ConnectionError:
+            raise RuntimeError(f"无法连接 LM Studio ({self.base_url})，请确认服务已启动")
+        except requests.exceptions.HTTPError as e:
+            raise RuntimeError(f"模型不支持视觉或请求格式错误: {str(e)}")
         except Exception as e:
-            return '[]'
+            raise RuntimeError(f"AI 视觉识别失败: {str(e)}")
 
     def parse_actions(self, text):
         """从 AI 回复中提取 action 指令"""
