@@ -1,6 +1,6 @@
 """
 仓库管理系统 - LM Studio AI 分析服务
-通过 OpenAI 兼容 API 调用本地部署的 qwen3.6-35b-a3b 模型
+通过 OpenAI 兼容 API 调用本地部署的 gemma-4-e4b-it 模型
 """
 
 import json
@@ -225,6 +225,58 @@ class AIService:
             {'role': 'user', 'content': user_message},
         ]
         return self._call(messages)
+
+    def recognize_inbound_image(self, image_base64):
+        """AI 视觉识别入库单图片，返回商品列表"""
+        prompt = """你是一个仓库入库单识别助手。请仔细查看这张入库单/送货单/发票图片，提取所有商品信息。
+
+请以 JSON 数组格式返回，每个商品一个对象：
+[
+  {"name": "商品名称", "sku": "SKU或型号", "quantity": 数量, "unit": "单位", "unit_price": 单价, "supplier": "供应商名称", "specification": "规格"}
+]
+
+规则：
+- 数量、单价必须是数字
+- 单位根据上下文推断（个/盒/箱/包/卷/台/只）
+- 供应商填入发货方/销售方名称
+- 如果没有明确信息，合理推断或留空
+- 只输出 JSON 数组，不要其他内容"""
+
+        messages = [{
+            'role': 'user',
+            'content': [
+                {'type': 'text', 'text': prompt},
+                {'type': 'image_url', 'image_url': {'url': f'data:image/jpeg;base64,{image_base64}'}}
+            ]
+        }]
+        raw = self._call_vision(messages)
+        # 清洗 AI 输出
+        import re as _re
+        raw = raw.strip()
+        raw = _re.sub(r'^```(?:json)?\s*', '', raw)
+        raw = _re.sub(r'\s*```\s*$', '', raw)
+        arr = _re.search(r'\[.*\]', raw, _re.DOTALL)
+        if arr: raw = arr.group(0)
+        return json.loads(raw)
+
+    def _call_vision(self, messages):
+        """调用 LM Studio Vision API"""
+        url = f"{self.base_url}/chat/completions"
+        payload = {
+            'model': self.model,
+            'messages': messages,
+            'temperature': 0.3,
+            'max_tokens': 4096,
+        }
+        try:
+            resp = requests.post(url, json=payload, timeout=self.timeout * 2)
+            resp.raise_for_status()
+            data = resp.json()
+            return data['choices'][0]['message']['content']
+        except requests.exceptions.Timeout:
+            return '[]'
+        except Exception as e:
+            return '[]'
 
     def parse_actions(self, text):
         """从 AI 回复中提取 action 指令"""

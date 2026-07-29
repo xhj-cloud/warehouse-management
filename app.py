@@ -243,6 +243,58 @@ def api_order_export():
 
 
 # ==========================================
+#  入库单视觉识别
+# ==========================================
+@app.route('/api/ai/inbound-recognize', methods=['POST'])
+def api_inbound_recognize():
+    """AI 识别入库单图片"""
+    import base64
+    try:
+        data = request.json
+        image_b64 = data.get('image', '')
+        if not image_b64:
+            return jsonify({'success': False, 'error': '请上传图片'}), 400
+
+        items = ai_service.recognize_inbound_image(image_b64)
+        imported = []
+        for item in items:
+            name = item.get('name', '').strip()
+            qty = int(item.get('quantity', 0))
+            if not name or qty <= 0: continue
+            sku = item.get('sku', '').strip() or name[:6].upper()
+            cat_name = item.get('supplier', '').strip()  # 可能 AI 错填
+            # 处理分类
+            cat_id = _auto_category(name)
+            # 处理供应商
+            sup_id = None
+            sup_name = item.get('supplier', '').strip()
+            if sup_name:
+                sups = SupplierModel.get_all()
+                smap = {s['name']: s['id'] for s in sups}
+                if sup_name in smap: sup_id = smap[sup_name]
+                else: sup_id = SupplierModel.create(sup_name)
+            # 创建或查找商品
+            prod = ProductModel.get_by_sku(sku) if sku else None
+            if prod:
+                pid = prod['id']
+            else:
+                pid = ProductModel.create(name, sku, cat_id, sup_id,
+                    item.get('unit', '个').strip() or '个',
+                    item.get('specification', '').strip() or '')
+            # 入库
+            up = float(item.get('unit_price', 0) or 0)
+            InventoryModel.stock_in(pid, qty, 'AI视觉识别', 'AI', f"入库单识别导入", unit_price=up, supplier_id=sup_id)
+            imported.append({'name': name, 'sku': sku, 'quantity': qty, 'unit_price': up})
+
+        return jsonify({'success': True, 'data': {'items': items, 'imported': imported, 'count': len(imported)}})
+    except json.JSONDecodeError:
+        return jsonify({'success': False, 'error': 'AI 识别结果解析失败，请重试或使用更清晰的图片'}), 400
+    except Exception as e:
+        _logger.error(f"入库单识别错误: {traceback.format_exc()}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+# ==========================================
 #  页面路由
 # ==========================================
 @app.route('/')

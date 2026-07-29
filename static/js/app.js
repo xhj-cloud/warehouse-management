@@ -71,6 +71,7 @@ function navigateTo(page) {
         customers: '客户管理',
         logs: '操作日志',
         order: '出库单',
+        'inbound-order': '入库单识别',
         transactions: '出入库记录',
         upload: '数据导入',
         ai: 'AI 智能分析',
@@ -84,6 +85,7 @@ function navigateTo(page) {
     if (page === 'suppliers') loadSuppliers();
     if (page === 'customers') loadCustomers();
     if (page === 'order') loadOrderPage();
+    if (page === 'inbound-order') initInboundOrder();
     if (page === 'transactions') loadTransactions();
     if (page === 'logs') loadAuditLog();
     if (page === 'upload') loadUploads();
@@ -1100,6 +1102,63 @@ function downloadOrder() {
     }).catch(function(e) {
         showToast('导出失败: ' + e.message, 'error');
     });
+}
+
+// ==========================================
+//  入库单识别
+// ==========================================
+function initInboundOrder() {
+    var zone = document.getElementById('inbound-upload-zone');
+    if (!zone) return;
+    zone.onclick = function() { document.getElementById('inbound-file-input').click(); };
+    zone.ondragover = function(e) { e.preventDefault(); zone.classList.add('dragover'); };
+    zone.ondragleave = function() { zone.classList.remove('dragover'); };
+    zone.ondrop = function(e) { e.preventDefault(); zone.classList.remove('dragover');
+        if (e.dataTransfer.files[0]) previewInboundImage(e.dataTransfer.files[0]); };
+}
+
+function previewInboundImage(file) {
+    if (!file) return;
+    var reader = new FileReader();
+    reader.onload = function(e) {
+        document.getElementById('inbound-preview-img').src = e.target.result;
+        document.getElementById('inbound-preview').style.display = 'block';
+        document.getElementById('inbound-upload-zone').style.display = 'none';
+        document.getElementById('inbound-result').style.display = 'none';
+        // 保存 base64 数据
+        window._inboundImageBase64 = e.target.result.split(',')[1];
+    };
+    reader.readAsDataURL(file);
+}
+
+async function recognizeInboundOrder() {
+    if (!window._inboundImageBase64) { showToast('请先上传图片', 'warning'); return; }
+    var status = document.getElementById('inbound-status');
+    status.textContent = '🤖 AI 正在识别入库单...';
+    status.style.color = '#3b82f6';
+
+    var r = await fetchAPI(API + '/ai/inbound-recognize', {
+        method: 'POST',
+        body: JSON.stringify({ image: window._inboundImageBase64 }),
+    });
+
+    if (r.success) {
+        status.textContent = '✅ 识别成功！已导入 ' + r.data.count + ' 条记录';
+        status.style.color = '#10b981';
+        // 显示结果
+        var div = document.getElementById('inbound-result');
+        div.style.display = 'block';
+        var html = '<div class="card"><h4>📋 识别结果</h4><table style="font-size:13px;"><tr><th>商品</th><th>SKU</th><th>数量</th><th>单价</th></tr>';
+        r.data.imported.forEach(function(i) {
+            html += '<tr><td>' + i.name + '</td><td>' + i.sku + '</td><td>+' + i.quantity + '</td><td>' + (i.unit_price > 0 ? '¥' + i.unit_price : '-') + '</td></tr>';
+        });
+        html += '</table></div>';
+        div.innerHTML = html;
+        loadProducts(); loadInventory();
+    } else {
+        status.textContent = '❌ ' + r.error;
+        status.style.color = '#ef4444';
+    }
 }
 
 // ==========================================

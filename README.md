@@ -25,7 +25,7 @@
 | 后端 | Python Flask |
 | 数据库 | MySQL 8.0 |
 | 前端 | 原生 HTML/CSS/JS（SPA，10 个功能页） |
-| AI | LM Studio（OpenAI 兼容 API）+ qwen3.6-35b-a3b |
+| AI | LM Studio（OpenAI 兼容 API）+ gemma-4-e4b-it |
 
 ## 项目结构
 
@@ -220,7 +220,7 @@ AI 功能依赖 LM Studio，不配置也不影响基础仓库管理功能。
 
 ```bash
 # 1. 在 AI 服务器上下载 LM Studio（lmstudio.ai）
-# 2. 下载模型 qwen3.6-35b-a3b 或其他兼容模型
+# 2. 下载模型 gemma-4-e4b-it 或其他兼容模型
 # 3. 启动 LM Studio 的本地 API 服务（默认端口 1234）
 # 4. 在 config.py 或 .env 中配置 LM_STUDIO_URL
 ```

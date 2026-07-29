@@ -38,6 +38,9 @@
         <div class="nav-item" data-page="order">
             <span class="icon">🧾</span> <span>出库单</span>
         </div>
+        <div class="nav-item" data-page="inbound-order">
+            <span class="icon">📸</span> <span>入库单识别</span>
+        </div>
         <div class="nav-item" data-page="transactions">
             <span class="icon">📝</span> <span>出入库记录</span>
         </div>
@@ -257,6 +260,32 @@
                         <tbody id="customers-tbody"></tbody>
                     </table>
                 </div>
+            </div>
+        </div>
+
+        <!-- ==================== 入库单识别 ==================== -->
+        <div class="page" id="page-inbound-order">
+            <div class="card">
+                <div class="card-header"><h3>📸 AI 入库单识别</h3></div>
+                <p style="font-size:13px;color:#64748b;margin-bottom:12px;">
+                    拍照或上传入库单/送货单/发票图片，AI 自动识别商品名称、数量、供应商并入库。
+                    <br>⚠️ 需要 LM Studio 加载支持视觉的多模态模型（如 qwen2-vl 系列）。
+                </p>
+                <div class="upload-zone" id="inbound-upload-zone" style="min-height:180px;">
+                    <div class="icon">📷</div>
+                    <div class="text">点击上传或拖拽入库单图片</div>
+                    <div class="hint">支持 JPG / PNG / PDF / WebP</div>
+                </div>
+                <input type="file" id="inbound-file-input" accept="image/*,.pdf" style="display:none;" onchange="previewInboundImage(this.files[0])">
+                <div id="inbound-preview" style="display:none;margin-top:12px;text-align:center;">
+                    <img id="inbound-preview-img" style="max-width:100%;max-height:400px;border-radius:8px;border:1px solid #e2e8f0;">
+                    <div style="margin-top:8px;">
+                        <button class="btn btn-outline btn-sm" onclick="document.getElementById('inbound-file-input').click()">🔄 重新选择</button>
+                        <button class="btn btn-primary" onclick="recognizeInboundOrder()">🤖 AI 识别入库</button>
+                    </div>
+                </div>
+                <div id="inbound-status" style="margin-top:12px;font-size:14px;"></div>
+                <div id="inbound-result" style="display:none;margin-top:16px;"></div>
             </div>
         </div>
 
