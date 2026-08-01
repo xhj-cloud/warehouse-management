@@ -68,7 +68,7 @@ ask_config() {
     read -p "3. 数据库用户 [warehouse]: " v; MYSQL_USER="${v:-warehouse}"
     read -p "4. 数据库名 [warehouse_db]: " v; MYSQL_DB="${v:-warehouse_db}"
     read -p "5. AI 地址 [http://127.0.0.1:1234/v1]: " v; AI_URL="${v:-http://127.0.0.1:1234/v1}"
-    read -p "6. AI 模型 [gemma-4-e4b-it]: " v; AI_MODEL="${v:-gemma-4-e4b-it}"
+    read -p "6. AI 模型 [qwen3.6-35b-a3b]: " v; AI_MODEL="${v:-qwen3.6-35b-a3b}"
     read -p "7. 服务端口 [5050]: " v; SERVICE_PORT="${v:-5050}"
     read -p "8. 安装 Nginx? [Y/n]: " v; INSTALL_NGINX="${v:-y}"
     read -p "9. 全新安装(会装 MySQL/Nginx)? [Y/n]: " v; IS_FRESH="${v:-y}"

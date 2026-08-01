@@ -1,6 +1,6 @@
 """
 仓库管理系统 - LM Studio AI 分析服务
-通过 OpenAI 兼容 API 调用本地部署的 gemma-4-e4b-it 模型
+通过 OpenAI 兼容 API 调用本地部署的 qwen3.6-35b-a3b 模型
 """
 
 import json
