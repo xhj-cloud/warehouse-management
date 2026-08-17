@@ -226,41 +226,68 @@ class AIService:
         ]
         return self._call(messages)
 
-    def recognize_inbound_image(self, image_base64):
-        """AI 视觉识别入库单图片，返回商品列表"""
-        prompt = """你是一个仓库入库单识别助手。请仔细查看这张入库单/送货单/发票图片，提取所有商品信息。
+    def ocr_image(self, image_base64):
+        """OCR 识别图片文字"""
+        import base64
+        import io
+        from PIL import Image
+        import pytesseract
 
-请以 JSON 数组格式返回，每个商品一个对象：
+        img_bytes = base64.b64decode(image_base64)
+        img = Image.open(io.BytesIO(img_bytes))
+        # 转灰度提高识别率
+        img = img.convert('L')
+        text = pytesseract.image_to_string(img, lang='chi_sim+eng')
+        return text.strip()
+
+    def recognize_inbound_image(self, image_base64):
+        """OCR + AI 识别入库单：先 OCR 提取文字，再由 AI 解析为结构化数据"""
+        # 1. OCR 提取文字
+        try:
+            ocr_text = self.ocr_image(image_base64)
+        except Exception as e:
+            raise RuntimeError(f"OCR 识别失败: {str(e)}。请确认已安装 tesseract-ocr 及中文语言包")
+
+        if not ocr_text or len(ocr_text) < 5:
+            raise RuntimeError("OCR 未识别到有效文字，请上传更清晰的图片")
+
+        # 2. AI 解析文字
+        prompt = f"""你是一个仓库入库单解析助手。请从以下 OCR 识别文字中提取商品信息。
+
+OCR 识别文字：
+{ocr_text}
+
+请解析为 JSON 数组，每个商品一个对象：
 [
-  {"name": "商品名称", "sku": "SKU或型号", "quantity": 数量, "unit": "单位", "unit_price": 单价, "supplier": "供应商名称", "specification": "规格"}
+  {{"name": "商品名称", "sku": "SKU或型号", "quantity": 数量, "unit": "单位", "unit_price": 单价, "supplier": "供应商名称", "specification": "规格"}}
 ]
 
 规则：
 - 数量、单价必须是数字
-- 单位根据上下文推断（个/盒/箱/包/卷/台/只）
+- 单位根据上下文推断（个/盒/箱/包/卷/台/只/件）
 - 供应商填入发货方/销售方名称
-- 如果没有明确信息，合理推断或留空
+- 忽略表头、页码、总价等非商品行
 - 只输出 JSON 数组，不要其他内容"""
 
-        messages = [{
-            'role': 'user',
-            'content': [
-                {'type': 'text', 'text': prompt},
-                {'type': 'image_url', 'image_url': {'url': f'data:image/jpeg;base64,{image_base64}'}}
-            ]
-        }]
-        raw = self._call_vision(messages)
-        # 清洗 AI 输出
+        messages = [
+            {'role': 'system', 'content': '你是一个精准的 JSON 数据解析器。只输出 JSON。'},
+            {'role': 'user', 'content': prompt},
+        ]
+        raw = self._call(messages)
+
+        # 清洗输出
         import re as _re
         raw = raw.strip()
         raw = _re.sub(r'^```(?:json)?\s*', '', raw)
         raw = _re.sub(r'\s*```\s*$', '', raw)
         arr = _re.search(r'\[.*\]', raw, _re.DOTALL)
         if arr: raw = arr.group(0)
+        raw = _re.sub(r',\s*]', ']', raw)
+        raw = _re.sub(r',\s*}', '}', raw)
         return json.loads(raw)
 
     def _call_vision(self, messages):
-        """调用 LM Studio Vision API"""
+        """调用 LM Studio Vision API（保留兼容）"""
         url = f"{self.base_url}/chat/completions"
         payload = {
             'model': self.model,
@@ -274,11 +301,11 @@ class AIService:
             data = resp.json()
             return data['choices'][0]['message']['content']
         except requests.exceptions.Timeout:
-            raise RuntimeError("AI 视觉识别超时，请检查 LM Studio 模型是否已加载")
+            raise RuntimeError("AI 视觉识别超时")
         except requests.exceptions.ConnectionError:
-            raise RuntimeError(f"无法连接 LM Studio ({self.base_url})，请确认服务已启动")
+            raise RuntimeError(f"无法连接 LM Studio ({self.base_url})")
         except requests.exceptions.HTTPError as e:
-            raise RuntimeError(f"模型不支持视觉或请求格式错误: {str(e)}")
+            raise RuntimeError(f"模型不支持视觉: {str(e)}")
         except Exception as e:
             raise RuntimeError(f"AI 视觉识别失败: {str(e)}")
 

@@ -268,8 +268,8 @@
             <div class="card">
                 <div class="card-header"><h3>📸 AI 入库单识别</h3></div>
                 <p style="font-size:13px;color:#64748b;margin-bottom:12px;">
-                    拍照或上传入库单/送货单/发票图片，AI 自动识别商品名称、数量、供应商并入库。
-                    <br>⚠️ 需要 LM Studio 加载支持视觉的多模态模型（如 qwen2-vl 系列）。
+                    拍照或上传入库单/送货单/发票图片，OCR 自动提取文字后由 AI 解析商品信息并入库。
+                    <br>⚠️ 服务器需安装：apt install tesseract-ocr tesseract-ocr-chi-sim
                 </p>
                 <div class="upload-zone" id="inbound-upload-zone" style="min-height:180px;">
                     <div class="icon">📷</div>
