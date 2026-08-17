@@ -246,6 +246,34 @@ sudo systemctl restart warehouse
 sudo journalctl -u warehouse -f
 ```
 
+## 测试
+
+测试分三层：
+
+| 文件 | 内容 | 依赖 |
+|------|------|------|
+| `tests/test_models.py` | 库存增减、超卖拦截、审计序列化等模型逻辑 | 无（mock） |
+| `tests/test_api.py` | Flask API 端点（CRUD/出入库/Excel 导入导出/AI 对话执行动作） | 无（test_client + mock） |
+| `tests/test_ai_service.py` | action 指令解析、AI 输出 JSON 清洗、OCR 流程、健康检查 | 无（mock HTTP） |
+| `tests/test_integration.py` | 真实 MySQL：建库脚本、批次价格链、低库存预警、Excel 导入端到端 | MySQL（不可达时自动跳过） |
+
+```bash
+# 安装测试依赖
+pip install -r requirements.txt -r requirements-dev.txt
+
+# 本地运行（无数据库也能跑，集成测试自动跳过）
+pytest tests/ -v
+
+# 指向服务器数据库跑集成测试（需 CREATE/DROP DATABASE 权限；
+# 会自动创建 warehouse_test_<pid> 独立库并在结束后删除，不触碰业务数据）
+DB_HOST=100.101.108.100 pytest tests/test_integration.py -v
+```
+
+已修复的历史 bug（均有回归测试覆盖）：
+
+- `StatsModel.get_dashboard` 的 `total_value_estimate` 曾误用 `SUM(quantity)`，现改为 `quantity * unit_price`（见 `tests/test_integration.py::TestDashboard::test_total_value_estimate_is_monetary`）
+- Excel 导入时空单元格曾被读成字符串 `"nan"`、无名称的行未被跳过，现已将 NaN 统一视为空值（见 `tests/test_api.py::TestUpload::test_xlsx_import_skips_rows_without_name`）
+
 ## AI 能做什么
 
 | 场景 | 对话示例 |

@@ -358,8 +358,10 @@ class StatsModel:
         low_stock = db.query_one(
             "SELECT COUNT(*) AS cnt FROM inventory WHERE quantity <= min_stock"
         )['cnt']
+        # 库存价值估算：数量 × 进货单价（unit_price），而非单纯的数量合计
         total_value_estimate = db.query_one(
-            "SELECT COALESCE(SUM(quantity), 0) AS cnt FROM inventory"
+            "SELECT COALESCE(SUM(i.quantity * p.unit_price), 0) AS cnt "
+            "FROM inventory i JOIN products p ON i.product_id = p.id"
         )['cnt']
 
         # 分类库存统计

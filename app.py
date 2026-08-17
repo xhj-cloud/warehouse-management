@@ -764,6 +764,12 @@ def api_upload():
                     name = str(row.get('name', '')).strip()
                     sku = str(row.get('sku', '')).strip()
 
+                    # 空单元格被 pandas 读成 NaN，str() 后变成字符串 "nan"，统一视为空值
+                    if name.lower() == 'nan':
+                        name = ''
+                    if sku.lower() == 'nan':
+                        sku = ''
+
                     if not name:
                         continue
 
