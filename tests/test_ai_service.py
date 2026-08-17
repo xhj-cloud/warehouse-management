@@ -142,10 +142,10 @@ class TestSmartImport:
         assert 'SCR-1' in captured['user_msg']
         assert '华强五金' in captured['user_msg']
 
-    def test_garbage_output_raises_json_decode_error(self, svc, monkeypatch):
+    def test_garbage_output_raises_parse_error(self, svc, monkeypatch):
         self._mock_db_context(monkeypatch)
         monkeypatch.setattr(svc, '_call', lambda messages: '抱歉，我无法解析这段内容。')
-        with pytest.raises(json.JSONDecodeError):
+        with pytest.raises(ValueError, match='格式错误'):
             svc.smart_import('随便说点什么')
 
 

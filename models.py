@@ -5,6 +5,7 @@
 import pymysql
 import decimal
 import json
+import threading
 from pymysql.constants import FIELD_TYPE
 from contextlib import contextmanager
 from config import MYSQL_CONFIG
@@ -33,13 +34,40 @@ _conversions[FIELD_TYPE.NEWDECIMAL] = float
 
 
 class Database:
-    """MySQL 数据库连接管理"""
+    """MySQL 数据库连接管理
+
+    - 单条 SQL：每次独立连接、独立提交（保持向后兼容）。
+    - 多语句事务：用 ``with db.transaction():`` 包住业务逻辑，同一线程内
+      所有 query/execute 会复用同一个连接，中途异常整体回滚。
+    """
 
     def __init__(self):
         self.config = {**MYSQL_CONFIG, 'conv': _conversions}
+        self._local = threading.local()
+
+    @contextmanager
+    def transaction(self):
+        """在单个事务里执行多步写操作；异常自动回滚。"""
+        conn = pymysql.connect(**self.config, cursorclass=pymysql.cursors.DictCursor)
+        conn.begin()
+        self._local.conn = conn
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            self._local.conn = None
+            conn.close()
 
     @contextmanager
     def get_connection(self):
+        shared = getattr(self._local, 'conn', None)
+        if shared is not None:
+            # 已在事务中：复用连接，事务由 transaction() 统一提交/回滚
+            yield shared
+            return
         conn = pymysql.connect(**self.config, cursorclass=pymysql.cursors.DictCursor)
         try:
             yield conn
@@ -238,39 +266,56 @@ class InventoryModel:
 
     @staticmethod
     def stock_in(product_id, quantity, batch_no='', operator='', notes='', unit_price=0, supplier_id=None):
-        """入库操作"""
-        inv = db.query_one("SELECT quantity FROM inventory WHERE product_id=%s", (product_id,))
-        if not inv:
-            db.execute("INSERT INTO inventory (product_id, quantity) VALUES (%s, 0)", (product_id,))
-            before_qty = 0
-        else:
-            before_qty = inv['quantity']
+        """入库操作（原子自增，避免并发读-改-写丢更新）"""
+        qty = int(quantity)
+        if qty <= 0:
+            raise ValueError("入库数量必须大于 0")
 
-        after_qty = before_qty + quantity
-        db.execute("UPDATE inventory SET quantity=%s WHERE product_id=%s", (after_qty, product_id))
+        # 原子自增；库存行不存在时（rowcount==0）补建后再算
+        affected, _ = db.execute(
+            "UPDATE inventory SET quantity = quantity + %s WHERE product_id=%s", (qty, product_id))
+        if affected == 0:
+            try:
+                db.execute("INSERT INTO inventory (product_id, quantity) VALUES (%s, %s)", (product_id, qty))
+            except pymysql.err.IntegrityError:
+                # 并发补建冲突（product_id 唯一）→ 对已有行再次自增
+                db.execute(
+                    "UPDATE inventory SET quantity = quantity + %s WHERE product_id=%s", (qty, product_id))
+
+        row = db.query_one("SELECT quantity FROM inventory WHERE product_id=%s", (product_id,))
+        after_qty = row['quantity'] if row else qty
+        before_qty = after_qty - qty
         db.execute(
             """INSERT INTO transactions (product_id, type, quantity, unit_price, supplier_id,
                before_qty, after_qty, batch_no, operator, notes)
                VALUES (%s, 'in', %s, %s, %s, %s, %s, %s, %s, %s)""",
-            (product_id, quantity, unit_price, supplier_id, before_qty, after_qty, batch_no, operator, notes)
+            (product_id, qty, unit_price, supplier_id, before_qty, after_qty, batch_no, operator, notes)
         )
 
     @staticmethod
     def stock_out(product_id, quantity, batch_no='', operator='', notes='', customer_id=None, unit_price=0):
-        """出库操作"""
-        inv = db.query_one("SELECT quantity FROM inventory WHERE product_id=%s", (product_id,))
-        if not inv:
-            raise ValueError("商品库存记录不存在")
-        before_qty = inv['quantity']
-        if before_qty < quantity:
-            raise ValueError(f"库存不足！当前库存: {before_qty}, 需要出库: {quantity}")
+        """出库操作（条件原子扣减，杜绝超卖与并发负库存）"""
+        qty = int(quantity)
+        if qty <= 0:
+            raise ValueError("出库数量必须大于 0")
 
-        after_qty = before_qty - quantity
-        db.execute("UPDATE inventory SET quantity=%s WHERE product_id=%s", (after_qty, product_id))
+        # 仅在库存足够时原子扣减；rowcount==0 说明库存行不存在或数量不足
+        affected, _ = db.execute(
+            "UPDATE inventory SET quantity = quantity - %s WHERE product_id=%s AND quantity >= %s",
+            (qty, product_id, qty))
+        if affected == 0:
+            row = db.query_one("SELECT quantity FROM inventory WHERE product_id=%s", (product_id,))
+            if not row:
+                raise ValueError("商品库存记录不存在")
+            raise ValueError(f"库存不足！当前库存: {row['quantity']}, 需要出库: {qty}")
+
+        row = db.query_one("SELECT quantity FROM inventory WHERE product_id=%s", (product_id,))
+        after_qty = row['quantity'] if row else 0
+        before_qty = after_qty + qty
         db.execute(
             """INSERT INTO transactions (product_id, type, quantity, unit_price, before_qty, after_qty,
                batch_no, operator, notes, customer_id) VALUES (%s, 'out', %s, %s, %s, %s, %s, %s, %s, %s)""",
-            (product_id, quantity, unit_price, before_qty, after_qty, batch_no, operator, notes, customer_id)
+            (product_id, qty, unit_price, before_qty, after_qty, batch_no, operator, notes, customer_id)
         )
 
 

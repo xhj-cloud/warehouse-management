@@ -180,6 +180,26 @@ class TestProducts:
         resp = client.post('/api/products', json={'name': '没有SKU'})
         assert resp.status_code == 400
 
+    def test_create_without_quantity_still_sets_location(self, app_mod, client, fake_db, monkeypatch):
+        """回归测试：不填初始库存时，库位/最低/最高库存仍应写入（不丢失）"""
+        create = make_recorder(9)
+        stock_in = make_recorder(None)
+        audit = make_recorder(None)
+        monkeypatch.setattr(app_mod.ProductModel, 'create', create)
+        monkeypatch.setattr(app_mod.InventoryModel, 'stock_in', stock_in)
+        monkeypatch.setattr(app_mod.AuditLog, 'log', audit)
+        monkeypatch.setattr(app_mod, 'db', fake_db)
+
+        resp = client.post('/api/products', json={
+            'name': '打印纸 A4', 'sku': 'P-1', 'location': 'B-02', 'min_stock': 20,
+        })
+        assert resp.status_code == 200
+        # 未提供数量 → 不应调用 stock_in
+        assert stock_in.calls == []
+        # 但库位/阈值照常写入
+        hits = fake_db.assert_executed('UPDATE inventory SET location')
+        assert hits[0][1] == ('B-02', 20, 9999, 9)
+
 
 # ==========================================
 #  库存 / 出入库 API
@@ -311,6 +331,34 @@ class TestUpload:
         # 期望行为：无名称的行应被跳过
         assert resp.get_json()['data']['rows_imported'] == 0
 
+    def test_xlsx_import_negative_quantity_not_written(self, app_mod, client, fake_db, monkeypatch):
+        """回归测试：数量为负的行不应生成出入库流水"""
+        self._patch_import_models(app_mod, fake_db, monkeypatch)
+        buf = make_xlsx([['商品名称', '数量'], ['螺丝 M6', -5]])
+
+        resp = client.post('/api/upload', data={
+            'file': (buf, 'neg.xlsx'), 'mode': 'replace'},
+            content_type='multipart/form-data')
+        assert resp.status_code == 200
+        body = resp.get_json()
+        assert body['data']['errors']           # 有行级错误提示
+        assert any('负' in e for e in body['data']['errors'])
+        assert not fake_db.find_executed('INSERT INTO transactions')  # 不写负库存流水
+
+    def test_xlsx_import_duplicate_sku_in_file_skipped(self, app_mod, client, fake_db, monkeypatch):
+        """回归测试：文件内重复 SKU 只导入首条，避免后者静默覆盖前者"""
+        self._patch_import_models(app_mod, fake_db, monkeypatch)
+        buf = make_xlsx([['商品名称', 'SKU', '数量'], ['螺丝 A', 'S1', 10], ['螺丝 B', 'S1', 20]])
+
+        resp = client.post('/api/upload', data={
+            'file': (buf, 'dup.xlsx'), 'mode': 'replace'},
+            content_type='multipart/form-data')
+        assert resp.status_code == 200
+        body = resp.get_json()
+        assert body['data']['rows_imported'] == 1
+        assert any('重复' in e for e in body['data']['errors'])
+        fake_db.assert_executed('INSERT INTO transactions', count=1)
+
 
 # ==========================================
 #  Excel 导出 API（出库单 / 库存清单）
@@ -421,7 +469,7 @@ class TestAI:
         assert prod_create.calls[0]['args'][:2] == ('电阻 10K', 'NEW-1')
         assert stock_in.calls[0]['args'][0] == 5
 
-    def test_chat_create_order_writes_excel(self, app_mod, client, tmp_path, monkeypatch):
+    def test_chat_create_order_writes_excel(self, app_mod, client, tmp_path, fake_db, monkeypatch):
         reply_text = (
             '出库单已创建。\n'
             '```action\n'
@@ -439,6 +487,9 @@ class TestAI:
         monkeypatch.setattr(app_mod.ProductModel, 'get_by_sku', make_recorder(
             {'id': 7, 'name': '螺丝 M6', 'specification': '不锈钢'}))
         monkeypatch.setattr(app_mod.InventoryModel, 'stock_out', stock_out)
+        # 出库单预检需要查询库存：mock db 返回充足库存
+        monkeypatch.setattr(app_mod, 'db', fake_db)
+        fake_db.one_side_effect = lambda sql, params=None: {'quantity': 10}
 
         # 出库单 Excel 写入临时目录，避免污染真实 uploads/
         monkeypatch.setattr(app_mod, 'UPLOAD_FOLDER', str(tmp_path))

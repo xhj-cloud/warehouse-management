@@ -12,14 +12,33 @@ function $(sel) { return document.querySelector(sel); }
 function $$(sel) { return document.querySelectorAll(sel); }
 
 async function fetchAPI(url, options = {}) {
+    // 默认 2 分钟超时，避免请求挂起时页面永久卡死；AI 接口可传更长 timeout
+    const timeoutMs = options.timeout || 120000;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
         const resp = await fetch(url, {
             headers: { 'Content-Type': 'application/json', ...options.headers },
             ...options,
+            signal: controller.signal,
         });
+        if (!resp.ok) {
+            // 5xx/4xx：优先解析 JSON 错误体，失败则回退到状态码描述
+            let detail = `服务器错误 (HTTP ${resp.status})`;
+            try {
+                const body = await resp.json();
+                if (body && body.error) detail = body.error;
+            } catch (_) { /* 非 JSON 响应（如 debug 页面） */ }
+            return { success: false, error: detail };
+        }
         return await resp.json();
     } catch (err) {
+        if (err.name === 'AbortError') {
+            return { success: false, error: '请求超时，请稍后重试' };
+        }
         return { success: false, error: `网络错误: ${err.message}` };
+    } finally {
+        clearTimeout(timer);
     }
 }
 
@@ -55,6 +74,8 @@ function showToast(message, type = 'info') {
 // ==========================================
 function navigateTo(page) {
     currentPage = page;
+    // 关闭残留的全屏弹层（进货批次等动态挂在 body 上），但保留商品弹窗节点
+    $$('.modal-overlay').forEach(el => { if (el.id !== 'product-modal') el.remove(); });
     // 更新导航激活状态
     $$('.nav-item').forEach(el => el.classList.remove('active'));
     $(`.nav-item[data-page="${page}"]`)?.classList.add('active');
@@ -239,9 +260,9 @@ async function loadCategoriesForSelect() {
     }
 }
 
-function showProductModal(productId = null) {
-    loadCategoriesForSelect();
-    loadSuppliersForSelect();
+async function showProductModal(productId = null) {
+    // 等待下拉选项加载完成后再赋值，避免 setTimeout 竞态导致编辑弹窗显示为空
+    await Promise.all([loadCategoriesForSelect(), loadSuppliersForSelect()]);
     const modal = $('#product-modal');
     const title = $('#product-modal-title');
     if (productId) {
@@ -251,8 +272,8 @@ function showProductModal(productId = null) {
             $('#product-id').value = p.id;
             $('#product-name').value = p.name;
             $('#product-sku').value = p.sku;
-            setTimeout(() => { $('#product-category').value = p.category_id || ''; }, 200);
-            setTimeout(() => { $('#product-supplier').value = p.supplier_id || ''; }, 250);
+            $('#product-category').value = p.category_id || '';
+            $('#product-supplier').value = p.supplier_id || '';
             $('#product-unit').value = p.unit;
             $('#product-spec').value = p.specification || '';
             $('#product-unit-price').value = p.unit_price ?? 0;
@@ -425,6 +446,8 @@ async function loadInventory() {
     const result = await fetchAPI(`${API}/inventory`);
     if (result.success) {
         renderInventoryTable(result.data);
+    } else {
+        showToast('库存加载失败: ' + result.error, 'error');
     }
 }
 
@@ -509,6 +532,8 @@ async function loadTransactions() {
     const result = await fetchAPI(`${API}/transactions?limit=200`);
     if (result.success) {
         renderTransactionsTable(result.data);
+    } else {
+        showToast('交易记录加载失败: ' + result.error, 'error');
     }
 }
 
@@ -545,6 +570,8 @@ async function loadUploads() {
     const result = await fetchAPI(`${API}/uploads`);
     if (result.success) {
         renderUploadsTable(result.data);
+    } else {
+        showToast('上传记录加载失败: ' + result.error, 'error');
     }
 }
 
@@ -625,6 +652,10 @@ async function uploadFile(file) {
     } catch (err) {
         $('#upload-status').textContent = `❌ 网络错误: ${err.message}`;
         $('#upload-status').style.color = '#ef4444';
+    } finally {
+        // 清空文件输入，允许连续选择同一个文件
+        const fi = $('#file-input');
+        if (fi) fi.value = '';
     }
 }
 
@@ -981,9 +1012,10 @@ document.addEventListener('click', function(e) {
 
 function addOrderItem() {
     var pid = parseInt(document.getElementById('order-product-select').value);
-    var qty = parseInt(document.getElementById('order-product-qty').value) || 1;
+    var qty = parseInt(document.getElementById('order-product-qty').value);
     var price = parseFloat(document.getElementById('order-product-price').value);
     if (!pid) { showToast('请选择商品', 'warning'); return; }
+    if (isNaN(qty) || qty <= 0) { showToast('请输入大于 0 的出货数量', 'warning'); return; }
     var prod = window._orderProducts.find(function(p) { return p.id === pid; });
     if (!prod) return;
     // 售价默认用商品已有售价
@@ -1038,7 +1070,8 @@ function renderOrderItems() {
 }
 
 function updateOrderQty(index, val) {
-    var qty = parseInt(val) || 1;
+    var qty = parseInt(val);
+    if (isNaN(qty) || qty <= 0) { showToast('数量必须大于 0', 'warning'); renderOrderItems(); return; }
     orderItems[index].quantity = qty;
     renderOrderItems();
 }
@@ -1131,33 +1164,45 @@ function previewInboundImage(file) {
     reader.readAsDataURL(file);
 }
 
+let _inboundRecognizing = false;
+
 async function recognizeInboundOrder() {
+    if (_inboundRecognizing) return;   // 防重复提交（AI 识别耗时长，双击会重复入库）
     if (!window._inboundImageBase64) { showToast('请先上传图片', 'warning'); return; }
+    _inboundRecognizing = true;
     var status = document.getElementById('inbound-status');
+    var btn = document.getElementById('inbound-recognize-btn');
     status.textContent = '🤖 AI 正在识别入库单...';
     status.style.color = '#3b82f6';
+    if (btn) btn.disabled = true;
 
-    var r = await fetchAPI(API + '/ai/inbound-recognize', {
-        method: 'POST',
-        body: JSON.stringify({ image: window._inboundImageBase64 }),
-    });
-
-    if (r.success) {
-        status.textContent = '✅ 识别成功！已导入 ' + r.data.count + ' 条记录';
-        status.style.color = '#10b981';
-        // 显示结果
-        var div = document.getElementById('inbound-result');
-        div.style.display = 'block';
-        var html = '<div class="card"><h4>📋 识别结果</h4><table style="font-size:13px;"><tr><th>商品</th><th>SKU</th><th>数量</th><th>单价</th></tr>';
-        r.data.imported.forEach(function(i) {
-            html += '<tr><td>' + i.name + '</td><td>' + i.sku + '</td><td>+' + i.quantity + '</td><td>' + (i.unit_price > 0 ? '¥' + i.unit_price : '-') + '</td></tr>';
+    try {
+        var r = await fetchAPI(API + '/ai/inbound-recognize', {
+            method: 'POST',
+            body: JSON.stringify({ image: window._inboundImageBase64 }),
+            timeout: 300000,
         });
-        html += '</table></div>';
-        div.innerHTML = html;
-        loadProducts(); loadInventory();
-    } else {
-        status.textContent = '❌ ' + r.error;
-        status.style.color = '#ef4444';
+
+        if (r.success) {
+            status.textContent = '✅ 识别成功！已导入 ' + r.data.count + ' 条记录';
+            status.style.color = '#10b981';
+            // 显示结果
+            var div = document.getElementById('inbound-result');
+            div.style.display = 'block';
+            var html = '<div class="card"><h4>📋 识别结果</h4><table style="font-size:13px;"><tr><th>商品</th><th>SKU</th><th>数量</th><th>单价</th></tr>';
+            r.data.imported.forEach(function(i) {
+                html += '<tr><td>' + i.name + '</td><td>' + i.sku + '</td><td>+' + i.quantity + '</td><td>' + (i.unit_price > 0 ? '¥' + i.unit_price : '-') + '</td></tr>';
+            });
+            html += '</table></div>';
+            div.innerHTML = html;
+            loadProducts(); loadInventory();
+        } else {
+            status.textContent = '❌ ' + r.error;
+            status.style.color = '#ef4444';
+        }
+    } finally {
+        _inboundRecognizing = false;
+        if (btn) btn.disabled = false;
     }
 }
 
@@ -1166,14 +1211,23 @@ async function recognizeInboundOrder() {
 // ==========================================
 function exportInventory() {
     fetch(API + '/inventory').then(function(r) { return r.json(); }).then(function(data) {
-        if (!data.success) return;
-        fetch(API + '/order/export-inventory', {
+        if (!data.success) { showToast('导出失败：无法获取库存数据', 'error'); return; }
+        return fetch(API + '/order/export-inventory', {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ items: data.data }),
-        }).then(function(r) { return r.blob(); }).then(function(b) {
-            var a = document.createElement('a'); a.href = URL.createObjectURL(b);
-            a.download = '库存清单_' + new Date().toISOString().substring(0,10) + '.xlsx'; a.click();
         });
+    }).then(function(r) {
+        if (!r) return;
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.blob();
+    }).then(function(b) {
+        if (!b) return;
+        var url = URL.createObjectURL(b);
+        var a = document.createElement('a'); a.href = url;
+        a.download = '库存清单_' + new Date().toISOString().substring(0,10) + '.xlsx'; a.click();
+        setTimeout(function() { URL.revokeObjectURL(url); }, 1000);
+    }).catch(function(e) {
+        showToast('导出失败: ' + e.message, 'error');
     });
 }
 
@@ -1217,6 +1271,8 @@ async function loadAuditLog(table) {
                 '</tr>';
         }
         t.innerHTML = html || '<tr><td colspan="7" style="text-align:center;padding:30px;">暂无日志</td></tr>';
+    } else {
+        showToast('日志加载失败: ' + r.error, 'error');
     }
 }
 

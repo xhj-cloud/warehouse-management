@@ -3,6 +3,8 @@
 用法：monkeypatch.setattr(models_mod, 'db', FakeDB())
 """
 
+from contextlib import contextmanager
+
 
 class FakeDB:
     def __init__(self):
@@ -10,6 +12,7 @@ class FakeDB:
         self._auto_id = 0
         self.query_side_effect = None   # callable(sql, params) -> list[dict]
         self.one_side_effect = None     # callable(sql, params) -> dict | None
+        self.update_affected = None     # 若设置，UPDATE 语句的受影响行数
 
     def query(self, sql, params=None):
         if self.query_side_effect:
@@ -24,7 +27,14 @@ class FakeDB:
     def execute(self, sql, params=None):
         self._auto_id += 1
         self.executed.append((sql, params))
+        if self.update_affected is not None and sql.lstrip().upper().startswith('UPDATE'):
+            return self.update_affected, self._auto_id
         return 1, self._auto_id
+
+    @contextmanager
+    def transaction(self):
+        """模拟事务上下文（单测中事务语义由断言保证，这里直接透传）。"""
+        yield None
 
     # ---- 断言辅助 ----
     def find_executed(self, fragment):

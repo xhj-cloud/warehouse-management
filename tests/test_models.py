@@ -44,26 +44,25 @@ class TestCleanValue:
 class TestStockIn:
     def test_stock_in_creates_inventory_row_when_missing(self, monkeypatch):
         db = FakeDB()
-        db.one_side_effect = lambda sql, params=None: None  # 无库存记录
+        db.update_affected = 0   # 原子自增未命中（无库存行）→ 走补建分支
+        db.one_side_effect = lambda sql, params=None: None
         monkeypatch.setattr(models_mod, 'db', db)
 
         models_mod.InventoryModel.stock_in(7, 10, batch_no='B1', operator='张三', unit_price=2.5)
 
-        # 1) 先补建库存行  2) 更新数量  3) 写入库流水
-        assert 'INSERT INTO inventory' in db.executed[0][0]
-        update_sql, update_params = db.executed[1]
-        assert 'UPDATE inventory SET quantity' in update_sql
-        assert update_params == (10, 7)
+        # 1) 原子自增未命中  2) 补建库存行  3) 写入库流水
+        assert 'UPDATE inventory SET quantity = quantity +' in db.executed[0][0]
+        assert 'INSERT INTO inventory' in db.executed[1][0]
         txn_sql, txn_params = db.executed[2]
         assert 'INSERT INTO transactions' in txn_sql
-        assert "'in'" in txn_sql or "type" in txn_sql
-        # params: product_id, quantity, unit_price, supplier_id, before, after, batch_no, operator, notes
+        # params: product_id, quantity, unit_price, supplier_id, before, after, ...
         assert txn_params[:3] == (7, 10, 2.5)
         assert txn_params[4:6] == (0, 10)
 
     def test_stock_in_accumulates_on_existing_inventory(self, monkeypatch):
         db = FakeDB()
-        db.one_side_effect = lambda sql, params=None: {'quantity': 3}
+        # 模拟自增后回读到 3 + 5 = 8
+        db.one_side_effect = lambda sql, params=None: {'quantity': 8}
         monkeypatch.setattr(models_mod, 'db', db)
 
         models_mod.InventoryModel.stock_in(7, 5)
@@ -71,46 +70,68 @@ class TestStockIn:
         # 已有库存时不应再 INSERT inventory 行
         assert not any('INSERT INTO inventory' in s for s, _ in db.executed)
         update_sql, update_params = db.executed[0]
-        assert 'UPDATE inventory SET quantity' in update_sql
-        assert update_params == (8, 7)
+        assert 'UPDATE inventory SET quantity = quantity +' in update_sql
+        assert update_params == (5, 7)
+        txn_sql, txn_params = db.executed[1]
+        assert 'INSERT INTO transactions' in txn_sql
+        assert txn_params[4:6] == (3, 8)  # before=3, after=8
+
+    def test_stock_in_rejects_non_positive_quantity(self, monkeypatch):
+        db = FakeDB()
+        monkeypatch.setattr(models_mod, 'db', db)
+
+        with pytest.raises(ValueError, match='大于 0'):
+            models_mod.InventoryModel.stock_in(7, -5)
+        assert db.executed == []
 
 
 class TestStockOut:
     def test_stock_out_insufficient_raises_value_error(self, monkeypatch):
         db = FakeDB()
+        db.update_affected = 0   # 条件扣减未命中 → 库存不足
         db.one_side_effect = lambda sql, params=None: {'quantity': 3}
         monkeypatch.setattr(models_mod, 'db', db)
 
         with pytest.raises(ValueError, match='库存不足'):
             models_mod.InventoryModel.stock_out(7, 10)
 
-        # 校验失败时不应有任何写操作
-        assert db.executed == []
+        # 校验失败时不应有任何事务写入
+        assert not any('INSERT INTO transactions' in s for s, _ in db.executed)
 
     def test_stock_out_missing_inventory_raises(self, monkeypatch):
         db = FakeDB()
+        db.update_affected = 0
         db.one_side_effect = lambda sql, params=None: None
         monkeypatch.setattr(models_mod, 'db', db)
 
         with pytest.raises(ValueError, match='库存记录不存在'):
             models_mod.InventoryModel.stock_out(7, 1)
-        assert db.executed == []
+        assert not any('INSERT INTO transactions' in s for s, _ in db.executed)
 
     def test_stock_out_success_records_before_after(self, monkeypatch):
         db = FakeDB()
-        db.one_side_effect = lambda sql, params=None: {'quantity': 10}
+        # 模拟扣减后回读 10 - 4 = 6
+        db.one_side_effect = lambda sql, params=None: {'quantity': 6}
         monkeypatch.setattr(models_mod, 'db', db)
 
         models_mod.InventoryModel.stock_out(7, 4, customer_id=2, unit_price=9.9)
 
         update_sql, update_params = db.executed[0]
-        assert 'UPDATE inventory SET quantity' in update_sql
-        assert update_params == (6, 7)
+        assert 'UPDATE inventory SET quantity = quantity -' in update_sql
+        assert update_params == (4, 7, 4)   # qty, product_id, 扣减条件 qty
         txn_sql, txn_params = db.executed[1]
         assert 'INSERT INTO transactions' in txn_sql
-        # params: product_id, quantity, unit_price, before, after, batch_no, operator, notes, customer_id
+        # params: product_id, quantity, unit_price, before, after, ... , customer_id
         assert txn_params[:5] == (7, 4, 9.9, 10, 6)
         assert txn_params[-1] == 2
+
+    def test_stock_out_rejects_non_positive_quantity(self, monkeypatch):
+        db = FakeDB()
+        monkeypatch.setattr(models_mod, 'db', db)
+
+        with pytest.raises(ValueError, match='大于 0'):
+            models_mod.InventoryModel.stock_out(7, 0)
+        assert db.executed == []
 
 
 # ==========================================

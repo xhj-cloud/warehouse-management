@@ -5,6 +5,7 @@
 import os
 import sys
 import json
+import uuid
 import decimal
 import traceback
 import logging
@@ -57,6 +58,81 @@ def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 
+def _clean_cell(value):
+    """把 pandas 空单元格（NaN/None/空串）统一归一为 ''，其余转字符串去首尾空白。"""
+    if value is None:
+        return ''
+    if isinstance(value, float):
+        import math
+        if math.isnan(value):
+            return ''
+    s = str(value).strip()
+    return '' if s.lower() == 'nan' else s
+
+
+def _to_int(value):
+    """宽容的整数转换：兼容 '10'、10、10.0、'10.5'（向下取整）；NaN/None/无法解析返回 None。"""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        f = float(str(value).strip())
+    except (ValueError, TypeError):
+        return None
+    if f != f or f in (float('inf'), float('-inf')):  # NaN / ±Inf
+        return None
+    return int(f)
+
+
+def _to_float(value, default=0.0):
+    """宽容的浮点转换；NaN/None/无法解析返回 default。"""
+    if value is None or isinstance(value, bool):
+        return default
+    try:
+        f = float(str(value).strip())
+    except (ValueError, TypeError):
+        return default
+    return f if f == f and f not in (float('inf'), float('-inf')) else default
+
+
+def _read_upload_df(filepath, ext):
+    """按扩展名读取上传的表格文件（含 CSV 编码回退与旧版 .xls 支持）。"""
+    if ext == 'csv':
+        try:
+            return pd.read_csv(filepath, encoding='utf-8-sig')
+        except UnicodeDecodeError:
+            return pd.read_csv(filepath, encoding='gbk')
+    if ext == 'xls':
+        return pd.read_excel(filepath, engine='xlrd')
+    return pd.read_excel(filepath, engine='openpyxl')
+
+
+def _apply_inventory_change(prod_id, new_qty, location='', min_stock=None, max_stock=None, operator='手动调整'):
+    """以「出入库流水」的方式把库存调整到目标数量（保留审计），并同步库位/阈值。
+
+    必须在 ``with db.transaction():`` 内调用，保证数量变更与流水写入原子化。
+    """
+    old_inv = db.query_one("SELECT quantity FROM inventory WHERE product_id=%s", (prod_id,))
+    old_qty = old_inv['quantity'] if old_inv else 0
+    delta = new_qty - old_qty
+    if delta > 0:
+        InventoryModel.stock_in(prod_id, delta, operator=operator, notes='手动调整库存')
+    elif delta < 0:
+        InventoryModel.stock_out(prod_id, -delta, operator=operator, notes='手动调整库存')
+    db.execute(
+        "UPDATE inventory SET location=%s, min_stock=%s, max_stock=%s WHERE product_id=%s",
+        (location or '',
+         min_stock if min_stock is not None else 0,
+         max_stock if max_stock is not None else 9999,
+         prod_id))
+
+
+def _safe_filename_part(name, default='客户'):
+    """只保留中文/字母/数字/下划线/连字符，其余替换为下划线；用于出库单文件名，防路径穿越。"""
+    import re
+    s = re.sub(r'[^\w\u4e00-\u9fff-]+', '_', str(name or '').strip())
+    return s.strip('_') or default
+
+
 # ==========================================
 #  审计日志 API
 # ==========================================
@@ -95,7 +171,7 @@ def api_inventory_batches():
             GROUP BY p.id, p.name, p.sku, p.unit, p.unit_price, i.quantity,
                      s.name, t.batch_no, t.unit_price
             HAVING net_qty > 0
-            ORDER BY p.name, t.id DESC
+            ORDER BY p.name, MAX(t.id) DESC
         """)
         return jsonify({'success': True, 'data': batches})
     except Exception as e:
@@ -248,7 +324,6 @@ def api_order_export():
 @app.route('/api/ai/inbound-recognize', methods=['POST'])
 def api_inbound_recognize():
     """AI 识别入库单图片"""
-    import base64
     try:
         data = request.json
         image_b64 = data.get('image', '')
@@ -256,37 +331,53 @@ def api_inbound_recognize():
             return jsonify({'success': False, 'error': '请上传图片'}), 400
 
         items = ai_service.recognize_inbound_image(image_b64)
-        imported = []
-        for item in items:
-            name = item.get('name', '').strip()
-            qty = int(item.get('quantity', 0))
-            if not name or qty <= 0: continue
-            sku = item.get('sku', '').strip() or name[:6].upper()
-            cat_name = item.get('supplier', '').strip()  # 可能 AI 错填
-            # 处理分类
-            cat_id = _auto_category(name)
-            # 处理供应商
-            sup_id = None
-            sup_name = item.get('supplier', '').strip()
-            if sup_name:
-                sups = SupplierModel.get_all()
-                smap = {s['name']: s['id'] for s in sups}
-                if sup_name in smap: sup_id = smap[sup_name]
-                else: sup_id = SupplierModel.create(sup_name)
-            # 创建或查找商品
-            prod = ProductModel.get_by_sku(sku) if sku else None
-            if prod:
-                pid = prod['id']
-            else:
-                pid = ProductModel.create(name, sku, cat_id, sup_id,
-                    item.get('unit', '个').strip() or '个',
-                    item.get('specification', '').strip() or '')
-            # 入库
-            up = float(item.get('unit_price', 0) or 0)
-            InventoryModel.stock_in(pid, qty, 'AI视觉识别', 'AI', f"入库单识别导入", unit_price=up, supplier_id=sup_id)
-            imported.append({'name': name, 'sku': sku, 'quantity': qty, 'unit_price': up})
+        if not isinstance(items, list):
+            return jsonify({'success': False, 'error': 'AI 返回格式异常，请重试或使用更清晰的图片'}), 400
 
-        return jsonify({'success': True, 'data': {'items': items, 'imported': imported, 'count': len(imported)}})
+        imported = []
+        skipped = []
+        with db.transaction():
+            for item in items:
+                if not isinstance(item, dict):
+                    skipped.append('忽略非对象条目')
+                    continue
+                name = _clean_cell(item.get('name'))
+                qty = _to_int(item.get('quantity'))
+                if not name:
+                    skipped.append('忽略无名商品')
+                    continue
+                if qty is None or qty <= 0:
+                    skipped.append(f'忽略数量无效的商品: {name}')
+                    continue
+                sku = _clean_cell(item.get('sku')) or name[:6].upper()
+                # 处理分类
+                cat_id = _auto_category(name)
+                # 处理供应商
+                sup_id = None
+                sup_name = _clean_cell(item.get('supplier'))
+                if sup_name:
+                    sups = SupplierModel.get_all()
+                    smap = {s['name']: s['id'] for s in sups}
+                    if sup_name in smap:
+                        sup_id = smap[sup_name]
+                    else:
+                        sup_id = SupplierModel.create(sup_name)
+                # 创建或查找商品
+                prod = ProductModel.get_by_sku(sku) if sku else None
+                if prod:
+                    pid = prod['id']
+                else:
+                    pid = ProductModel.create(name, sku, cat_id, sup_id,
+                        _clean_cell(item.get('unit')) or '个',
+                        _clean_cell(item.get('specification')))
+                # 入库
+                up = _to_float(item.get('unit_price'))
+                InventoryModel.stock_in(pid, qty, 'AI视觉识别', 'AI', '入库单识别导入',
+                                        unit_price=up, supplier_id=sup_id)
+                imported.append({'name': name, 'sku': sku, 'quantity': qty, 'unit_price': up})
+
+        return jsonify({'success': True, 'data': {
+            'items': items, 'imported': imported, 'skipped': skipped, 'count': len(imported)}})
     except RuntimeError as e:
         return jsonify({'success': False, 'error': str(e)}), 500
     except json.JSONDecodeError:
@@ -508,23 +599,28 @@ def api_product_create():
             unit_price=float(data.get('unit_price', 0) or 0),
             sale_price=float(data.get('sale_price', 0) or 0),
         )
-        # 如果有初始库存，用 stock_in 生成入库记录
-        if data.get('quantity') is not None and int(data.get('quantity', 0)) > 0:
+        # 初始库存走 stock_in（生成入库流水），数量缺失/为 0 时跳过
+        qty = _to_int(data.get('quantity'))
+        if qty is not None and qty < 0:
+            return jsonify({'success': False, 'error': '数量不能为负数'}), 400
+        if qty is not None and qty > 0:
             InventoryModel.stock_in(
                 prod_id,
-                quantity=int(data['quantity']),
+                quantity=qty,
                 operator='初始创建',
                 notes='新建商品初始库存',
                 unit_price=float(data.get('unit_price', 0) or 0),
                 supplier_id=data.get('supplier_id'),
             )
-            # 额外更新库位和阈值
-            if data.get('location') or data.get('min_stock') is not None:
-                db.execute(
-                    "UPDATE inventory SET location=%s, min_stock=%s, max_stock=%s WHERE product_id=%s",
-                    (data.get('location', ''), int(data.get('min_stock', 0)),
-                     int(data.get('max_stock', 9999)), prod_id)
-                )
+        # 库位/阈值无条件写入（ProductModel.create 已保证库存行存在），
+        # 修复「不填初始库存时库位/最低/最高库存全部丢失」的问题
+        db.execute(
+            "UPDATE inventory SET location=%s, min_stock=%s, max_stock=%s WHERE product_id=%s",
+            (_clean_cell(data.get('location')),
+             _to_int(data.get('min_stock')) or 0,
+             _to_int(data.get('max_stock')) or 9999,
+             prod_id)
+        )
         AuditLog.log('create', 'products', prod_id, new_data=data, operator='管理员')
         return jsonify({'success': True, 'id': prod_id})
     except Exception as e:
@@ -550,15 +646,18 @@ def api_product_update(prod_id):
             sale_price=float(data.get('sale_price', 0) or 0),
         )
         AuditLog.log('update', 'products', prod_id, old_data=old, new_data=data, operator='管理员')
-        # 同步更新库存信息
-        if data.get('quantity') is not None:
-            InventoryModel.update(
-                prod_id,
-                quantity=int(data['quantity']),
-                location=data.get('location', ''),
-                min_stock=int(data.get('min_stock', 0)),
-                max_stock=int(data.get('max_stock', 9999)),
-            )
+        # 同步更新库存信息（数量变化走出入库流水，保留审计）
+        new_qty = _to_int(data.get('quantity'))
+        if new_qty is not None:
+            if new_qty < 0:
+                return jsonify({'success': False, 'error': '数量不能为负数'}), 400
+            with db.transaction():
+                _apply_inventory_change(
+                    prod_id, new_qty,
+                    location=_clean_cell(data.get('location')),
+                    min_stock=_to_int(data.get('min_stock')),
+                    max_stock=_to_int(data.get('max_stock')),
+                )
         return jsonify({'success': True})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 400
@@ -602,17 +701,24 @@ def api_low_stock():
 
 @app.route('/api/inventory/<int:product_id>', methods=['PUT'])
 def api_inventory_update(product_id):
-    """更新库存"""
+    """更新库存（数量变化走出入库流水，保留审计）"""
     try:
         data = request.json
-        InventoryModel.update(
-            product_id,
-            quantity=int(data['quantity']),
-            location=data.get('location', ''),
-            min_stock=int(data.get('min_stock', 0)),
-            max_stock=int(data.get('max_stock', 9999)),
-        )
+        new_qty = _to_int(data.get('quantity'))
+        if new_qty is None:
+            return jsonify({'success': False, 'error': '缺少 quantity 参数'}), 400
+        if new_qty < 0:
+            return jsonify({'success': False, 'error': '数量不能为负数'}), 400
+        with db.transaction():
+            _apply_inventory_change(
+                product_id, new_qty,
+                location=_clean_cell(data.get('location')),
+                min_stock=_to_int(data.get('min_stock')),
+                max_stock=_to_int(data.get('max_stock')),
+            )
         return jsonify({'success': True})
+    except ValueError as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 400
 
@@ -702,6 +808,7 @@ def api_transaction_stats():
 @app.route('/api/upload', methods=['POST'])
 def api_upload():
     """上传 Excel 文件并导入数据"""
+    filepath = None
     try:
         if 'file' not in request.files:
             return jsonify({'success': False, 'error': '请选择文件'}), 400
@@ -716,19 +823,27 @@ def api_upload():
         # 导入模式：replace=全量覆盖, increment=增量累加
         mode = request.form.get('mode', 'replace')
 
-        filename = secure_filename(file.filename)
-        filepath = os.path.join(UPLOAD_FOLDER, f"{datetime.now().strftime('%Y%m%d%H%M%S')}_{filename}")
+        original_name = file.filename
+        ext = original_name.rsplit('.', 1)[1].lower() if '.' in original_name else ''
+        # 存储用 uuid 命名（secure_filename 会剥掉中文名），原始文件名仅入 DB 记录
+        filename = f"{datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex}.{ext}"
+        filepath = os.path.join(UPLOAD_FOLDER, filename)
         file.save(filepath)
         file_size = os.path.getsize(filepath)
 
         # 记录上传
-        upload_id = ExcelUploadModel.create(filename, file_size)
+        upload_id = ExcelUploadModel.create(original_name, file_size)
         ExcelUploadModel.update_status(upload_id, 'processing')
 
-        # 解析 Excel
+        # 解析 Excel / CSV
         try:
-            if filename.endswith('.csv'):
-                df = pd.read_csv(filepath)
+            if ext == 'csv':
+                try:
+                    df = pd.read_csv(filepath, encoding='utf-8-sig')
+                except UnicodeDecodeError:
+                    df = pd.read_csv(filepath, encoding='gbk')
+            elif ext == 'xls':
+                df = pd.read_excel(filepath, engine='xlrd')
             else:
                 df = pd.read_excel(filepath, engine='openpyxl')
 
@@ -756,138 +871,135 @@ def api_upload():
 
             rows_imported = 0
             errors = []
-            # 用于自动生成库位的计数器
+            seen_skus = set()   # 文件内重复 SKU 检测
             loc_counters = {}
 
-            for idx, row in df.iterrows():
-                try:
-                    name = str(row.get('name', '')).strip()
-                    sku = str(row.get('sku', '')).strip()
+            # 多行写入包在一个事务里：意外异常整体回滚，不留半截数据
+            with db.transaction():
+                for idx, row in df.iterrows():
+                    try:
+                        name = _clean_cell(row.get('name'))
+                        sku = _clean_cell(row.get('sku'))
 
-                    # 空单元格被 pandas 读成 NaN，str() 后变成字符串 "nan"，统一视为空值
-                    if name.lower() == 'nan':
-                        name = ''
-                    if sku.lower() == 'nan':
-                        sku = ''
+                        if not name:
+                            continue
+                        if sku and sku in seen_skus:
+                            errors.append(f"第 {idx+2} 行: 文件内 SKU 重复({sku})，已跳过")
+                            continue
+                        if sku:
+                            seen_skus.add(sku)
 
-                    if not name:
-                        continue
-
-                    # 处理分类
-                    cat_name = str(row.get('category', '')).strip()
-                    category_id = None
-                    if cat_name:
-                        existing_cat = CategoryModel.get_all()
-                        cat_map = {c['name']: c['id'] for c in existing_cat}
-                        if cat_name in cat_map:
-                            category_id = cat_map[cat_name]
-                        else:
-                            category_id = CategoryModel.create(cat_name)
-
-                    # 自动生成 SKU
-                    if not sku:
-                        prefix = (cat_name[:3] if cat_name else name[:3]).upper()
-                        # 用分类+序号生成唯一 SKU
-                        base = prefix
-                        counter = 1
-                        while True:
-                            candidate = f'{base}-{counter:04d}'
-                            if not ProductModel.get_by_sku(candidate):
-                                break
-                            counter += 1
-                        sku = candidate
-
-                    # 创建或更新商品
-                    existing = ProductModel.get_by_sku(sku)
-                    if existing:
-                        ProductModel.update(
-                            existing['id'],
-                            name=name,
-                            sku=sku,
-                            category_id=category_id,
-                            unit=str(row.get('unit', '个')).strip() or '个',
-                            specification=str(row.get('specification', '')).strip(),
-                            description=str(row.get('description', '')).strip(),
-                        )
-                        prod_id = existing['id']
-                    else:
-                        prod_id = ProductModel.create(
-                            name=name,
-                            sku=sku,
-                            category_id=category_id,
-                            unit=str(row.get('unit', '个')).strip() or '个',
-                            specification=str(row.get('specification', '')).strip(),
-                            description=str(row.get('description', '')).strip(),
-                        )
-
-                    # 更新库存（对比差异，自动生成出入库记录）
-                    qty = row.get('quantity')
-                    if qty is not None and str(qty).strip() != '' and str(qty).strip().lower() != 'nan':
-                        new_qty = int(float(qty))
-                        location = str(row.get('location', '')).strip()
-                        # 自动生成库位
-                        if not location:
-                            cat_key = cat_name[:2] if cat_name else 'ZZ'
-                            if cat_key not in loc_counters:
-                                # 查当前分类最大编号
-                                max_loc = db.query_one(
-                                    """SELECT location FROM inventory i
-                                       JOIN products p ON i.product_id=p.id
-                                       WHERE p.category_id=%s AND i.location LIKE %s
-                                       ORDER BY i.location DESC LIMIT 1""",
-                                    (category_id, f'{cat_key}-%')
-                                )
-                                if max_loc and max_loc['location']:
-                                    try:
-                                        loc_counters[cat_key] = int(max_loc['location'].split('-')[1]) + 1
-                                    except (ValueError, IndexError):
-                                        loc_counters[cat_key] = 1
-                                else:
-                                    loc_counters[cat_key] = 1
+                        # 处理分类
+                        cat_name = _clean_cell(row.get('category'))
+                        category_id = None
+                        if cat_name:
+                            existing_cat = CategoryModel.get_all()
+                            cat_map = {c['name']: c['id'] for c in existing_cat}
+                            if cat_name in cat_map:
+                                category_id = cat_map[cat_name]
                             else:
-                                loc_counters[cat_key] += 1
-                            location = f'{cat_key}-{loc_counters[cat_key]:03d}'
-                        min_stock = int(float(row.get('min_stock', 0))) if row.get('min_stock') and str(row['min_stock']).strip() != '' else 0
-                        max_stock = int(float(row.get('max_stock', 9999))) if row.get('max_stock') and str(row['max_stock']).strip() != '' else 9999
+                                category_id = CategoryModel.create(cat_name)
 
-                        # 查询原库存
-                        old_inv = db.query_one(
-                            "SELECT quantity FROM inventory WHERE product_id = %s", (prod_id,)
-                        )
-                        old_qty = old_inv['quantity'] if old_inv else 0
+                        # 自动生成 SKU
+                        if not sku:
+                            prefix = (cat_name[:3] if cat_name else name[:3]).upper()
+                            counter = 1
+                            while True:
+                                candidate = f'{prefix}-{counter:04d}'
+                                if not ProductModel.get_by_sku(candidate):
+                                    break
+                                counter += 1
+                            sku = candidate
 
-                        # 增量模式：Excel 数量为新增量，累加到现有库存
-                        if mode == 'increment':
-                            diff = new_qty  # diff 为正，表示入库
-                            new_qty = old_qty + new_qty
+                        # 创建或更新商品（空单元格统一清洗，避免写入字面 "nan"）
+                        unit = _clean_cell(row.get('unit')) or '个'
+                        specification = _clean_cell(row.get('specification'))
+                        description = _clean_cell(row.get('description'))
+                        existing = ProductModel.get_by_sku(sku)
+                        if existing:
+                            ProductModel.update(
+                                existing['id'], name=name, sku=sku, category_id=category_id,
+                                unit=unit, specification=specification, description=description,
+                            )
+                            prod_id = existing['id']
                         else:
-                            diff = new_qty - old_qty
-
-                        # 更新库存基础信息（数量、库位、阈值）
-                        db.execute(
-                            """UPDATE inventory SET quantity=%s, location=%s,
-                               min_stock=%s, max_stock=%s WHERE product_id=%s""",
-                            (new_qty, location, min_stock, max_stock, prod_id)
-                        )
-
-                        # 如果数量有变化，生成出入库记录
-                        if diff != 0:
-                            txn_type = 'in' if diff > 0 else 'out'
-                            txn_qty = abs(diff)
-                            batch_no = f'Excel-{upload_id}'
-                            db.execute(
-                                """INSERT INTO transactions
-                                   (product_id, type, quantity, before_qty, after_qty, batch_no, operator, notes)
-                                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
-                                (prod_id, txn_type, txn_qty, old_qty, new_qty,
-                                 batch_no, 'Excel导入', f'文件: {filename}')
+                            prod_id = ProductModel.create(
+                                name=name, sku=sku, category_id=category_id,
+                                unit=unit, specification=specification, description=description,
                             )
 
-                    rows_imported += 1
-                except Exception as e:
-                    errors.append(f"第 {idx+2} 行: {str(e)}")
+                        # 更新库存（对比差异，自动生成出入库记录）
+                        qty_raw = row.get('quantity')
+                        qty = _to_int(qty_raw) if (qty_raw is not None and _clean_cell(qty_raw) != '') else None
+                        if qty is not None:
+                            if qty < 0:
+                                errors.append(f"第 {idx+2} 行: 数量为负({qty})，已跳过库存更新")
+                            else:
+                                location = _clean_cell(row.get('location'))
+                                # 自动生成库位
+                                if not location:
+                                    cat_key = cat_name[:2] if cat_name else 'ZZ'
+                                    if cat_key not in loc_counters:
+                                        max_loc = db.query_one(
+                                            """SELECT location FROM inventory i
+                                               JOIN products p ON i.product_id=p.id
+                                               WHERE p.category_id=%s AND i.location LIKE %s
+                                               ORDER BY i.location DESC LIMIT 1""",
+                                            (category_id, f'{cat_key}-%')
+                                        )
+                                        if max_loc and max_loc['location']:
+                                            try:
+                                                loc_counters[cat_key] = int(max_loc['location'].split('-')[1]) + 1
+                                            except (ValueError, IndexError):
+                                                loc_counters[cat_key] = 1
+                                        else:
+                                            loc_counters[cat_key] = 1
+                                    else:
+                                        loc_counters[cat_key] += 1
+                                    location = f'{cat_key}-{loc_counters[cat_key]:03d}'
+                                min_stock = _to_int(row.get('min_stock')) or 0
+                                max_stock = _to_int(row.get('max_stock')) or 9999
 
-            ExcelUploadModel.update_status(upload_id, 'success', rows_imported)
+                                # 查询原库存
+                                old_inv = db.query_one(
+                                    "SELECT quantity FROM inventory WHERE product_id = %s", (prod_id,)
+                                )
+                                old_qty = old_inv['quantity'] if old_inv else 0
+
+                                # 增量模式：Excel 数量为新增量，累加到现有库存
+                                if mode == 'increment':
+                                    diff = qty
+                                    new_qty = old_qty + qty
+                                else:
+                                    diff = qty - old_qty
+                                    new_qty = qty
+
+                                # 更新库存基础信息（数量、库位、阈值）
+                                db.execute(
+                                    """UPDATE inventory SET quantity=%s, location=%s,
+                                       min_stock=%s, max_stock=%s WHERE product_id=%s""",
+                                    (new_qty, location, min_stock, max_stock, prod_id)
+                                )
+
+                                # 如果数量有变化，生成出入库记录
+                                if diff != 0:
+                                    txn_type = 'in' if diff > 0 else 'out'
+                                    txn_qty = abs(diff)
+                                    batch_no = f'Excel-{upload_id}'
+                                    db.execute(
+                                        """INSERT INTO transactions
+                                           (product_id, type, quantity, before_qty, after_qty, batch_no, operator, notes)
+                                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+                                        (prod_id, txn_type, txn_qty, old_qty, new_qty,
+                                         batch_no, 'Excel导入', f'文件: {original_name}')
+                                    )
+
+                        rows_imported += 1
+                    except Exception as e:
+                        errors.append(f"第 {idx+2} 行: {str(e)}")
+
+            err_summary = f"{len(errors)} 行出错" if errors else ''
+            ExcelUploadModel.update_status(upload_id, 'success', rows_imported, err_summary)
 
             return jsonify({
                 'success': True,
@@ -905,6 +1017,13 @@ def api_upload():
 
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        # 清理临时上传文件，避免 uploads/ 无限增长
+        if filepath and os.path.exists(filepath):
+            try:
+                os.remove(filepath)
+            except OSError:
+                pass
 
 
 @app.route('/api/uploads')
@@ -922,18 +1041,20 @@ def api_uploads():
 # ==========================================
 @app.route('/api/upload/suppliers', methods=['POST'])
 def api_upload_suppliers():
+    filepath = None
     try:
         if 'file' not in request.files:
             return jsonify({'success': False, 'error': '请选择文件'}), 400
         file = request.files['file']
-        filename = secure_filename(file.filename)
-        filepath = os.path.join(UPLOAD_FOLDER, f"supplier_{datetime.now().strftime('%Y%m%d%H%M%S')}_{filename}")
+        original_name = file.filename
+        ext = original_name.rsplit('.', 1)[1].lower() if '.' in original_name else ''
+        if ext not in ALLOWED_EXTENSIONS:
+            return jsonify({'success': False, 'error': '仅支持 .xlsx .xls .csv 格式'}), 400
+        filename = f"supplier_{datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex}.{ext}"
+        filepath = os.path.join(UPLOAD_FOLDER, filename)
         file.save(filepath)
 
-        if filename.endswith('.csv'):
-            df = pd.read_csv(filepath)
-        else:
-            df = pd.read_excel(filepath, engine='openpyxl')
+        df = _read_upload_df(filepath, ext)
 
         col_map = {'名称': 'name', 'name': 'name', '供应商名称': 'name',
                    '联系人': 'contact', '电话': 'phone', 'phone': 'phone',
@@ -945,33 +1066,43 @@ def api_upload_suppliers():
         df.rename(columns=rename_map, inplace=True)
 
         count = 0
-        for _, row in df.iterrows():
-            name = str(row.get('name', '')).strip()
-            if not name: continue
-            SupplierModel.create(
-                name, str(row.get('contact', '')).strip(), str(row.get('phone', '')).strip(),
-                str(row.get('email', '')).strip(), str(row.get('address', '')).strip(),
-                str(row.get('notes', '')).strip())
-            count += 1
+        with db.transaction():
+            for _, row in df.iterrows():
+                name = _clean_cell(row.get('name'))
+                if not name:
+                    continue
+                SupplierModel.create(
+                    name, _clean_cell(row.get('contact')), _clean_cell(row.get('phone')),
+                    _clean_cell(row.get('email')), _clean_cell(row.get('address')),
+                    _clean_cell(row.get('notes')))
+                count += 1
         return jsonify({'success': True, 'data': {'rows_imported': count}})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 400
+    finally:
+        if filepath and os.path.exists(filepath):
+            try:
+                os.remove(filepath)
+            except OSError:
+                pass
 
 
 @app.route('/api/upload/customers', methods=['POST'])
 def api_upload_customers():
+    filepath = None
     try:
         if 'file' not in request.files:
             return jsonify({'success': False, 'error': '请选择文件'}), 400
         file = request.files['file']
-        filename = secure_filename(file.filename)
-        filepath = os.path.join(UPLOAD_FOLDER, f"customer_{datetime.now().strftime('%Y%m%d%H%M%S')}_{filename}")
+        original_name = file.filename
+        ext = original_name.rsplit('.', 1)[1].lower() if '.' in original_name else ''
+        if ext not in ALLOWED_EXTENSIONS:
+            return jsonify({'success': False, 'error': '仅支持 .xlsx .xls .csv 格式'}), 400
+        filename = f"customer_{datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex}.{ext}"
+        filepath = os.path.join(UPLOAD_FOLDER, filename)
         file.save(filepath)
 
-        if filename.endswith('.csv'):
-            df = pd.read_csv(filepath)
-        else:
-            df = pd.read_excel(filepath, engine='openpyxl')
+        df = _read_upload_df(filepath, ext)
 
         col_map = {'名称': 'name', 'name': 'name', '客户名称': 'name',
                    '联系人': 'contact', '电话': 'phone', 'phone': 'phone',
@@ -983,17 +1114,25 @@ def api_upload_customers():
         df.rename(columns=rename_map, inplace=True)
 
         count = 0
-        for _, row in df.iterrows():
-            name = str(row.get('name', '')).strip()
-            if not name: continue
-            CustomerModel.create(
-                name, str(row.get('contact', '')).strip(), str(row.get('phone', '')).strip(),
-                str(row.get('email', '')).strip(), str(row.get('address', '')).strip(),
-                str(row.get('notes', '')).strip())
-            count += 1
+        with db.transaction():
+            for _, row in df.iterrows():
+                name = _clean_cell(row.get('name'))
+                if not name:
+                    continue
+                CustomerModel.create(
+                    name, _clean_cell(row.get('contact')), _clean_cell(row.get('phone')),
+                    _clean_cell(row.get('email')), _clean_cell(row.get('address')),
+                    _clean_cell(row.get('notes')))
+                count += 1
         return jsonify({'success': True, 'data': {'rows_imported': count}})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 400
+    finally:
+        if filepath and os.path.exists(filepath):
+            try:
+                os.remove(filepath)
+            except OSError:
+                pass
 
 
 # ==========================================
@@ -1029,68 +1168,73 @@ def api_ai_smart_import():
 
         # 1. AI 解析自然语言
         items = ai_service.smart_import(text)
+        if not isinstance(items, list):
+            return jsonify({'success': False, 'error': 'AI 返回格式异常，请重新描述'}), 400
 
-        # 2. 逐个导入
+        # 2. 逐个导入（整体事务，异常回滚，避免半截数据）
         imported = []
-        for item in items:
-            name = item.get('name', '').strip()
-            sku = item.get('sku', '').strip()
-            category_name = item.get('category', '').strip()
-            unit = item.get('unit', '个').strip() or '个'
-            qty = int(item.get('quantity', 0))
-            notes = item.get('notes', '')
+        with db.transaction():
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                name = _clean_cell(item.get('name'))
+                sku = _clean_cell(item.get('sku'))
+                category_name = _clean_cell(item.get('category'))
+                unit = _clean_cell(item.get('unit')) or '个'
+                qty = _to_int(item.get('quantity'))
+                notes = _clean_cell(item.get('notes'))
 
-            if not name or not sku or qty <= 0:
-                continue
+                if not name or not sku or qty is None or qty <= 0:
+                    continue
 
-            # 处理分类
-            category_id = None
-            if category_name:
-                existing_cats = CategoryModel.get_all()
-                cat_map = {c['name']: c['id'] for c in existing_cats}
-                if category_name in cat_map:
-                    category_id = cat_map[category_name]
+                # 处理分类
+                category_id = None
+                if category_name:
+                    existing_cats = CategoryModel.get_all()
+                    cat_map = {c['name']: c['id'] for c in existing_cats}
+                    if category_name in cat_map:
+                        category_id = cat_map[category_name]
+                    else:
+                        category_id = CategoryModel.create(category_name)
+
+                # 处理供应商
+                supplier_id = None
+                supplier_name = _clean_cell(item.get('supplier') or item.get('supplier_name'))
+                if supplier_name:
+                    existing_sups = SupplierModel.get_all()
+                    sup_map = {s['name']: s['id'] for s in existing_sups}
+                    if supplier_name in sup_map:
+                        supplier_id = sup_map[supplier_name]
+                    else:
+                        supplier_id = SupplierModel.create(supplier_name)
+
+                # 查找或创建商品
+                existing = ProductModel.get_by_sku(sku)
+                if existing:
+                    prod_id = existing['id']
+                    ProductModel.update(prod_id, name, sku, category_id, supplier_id, unit,
+                                        _clean_cell(item.get('specification')), notes)
                 else:
-                    category_id = CategoryModel.create(category_name)
+                    prod_id = ProductModel.create(name, sku, category_id, supplier_id, unit,
+                                                  _clean_cell(item.get('specification')), notes)
 
-            # 处理供应商
-            supplier_id = None
-            supplier_name = item.get('supplier', '') or item.get('supplier_name', '')
-            if supplier_name.strip():
-                existing_sups = SupplierModel.get_all()
-                sup_map = {s['name']: s['id'] for s in existing_sups}
-                if supplier_name.strip() in sup_map:
-                    supplier_id = sup_map[supplier_name.strip()]
-                else:
-                    supplier_id = SupplierModel.create(supplier_name.strip())
+                # 入库
+                old_inv = db.query_one("SELECT quantity FROM inventory WHERE product_id = %s", (prod_id,))
+                old_qty = old_inv['quantity'] if old_inv else 0
+                new_qty = old_qty + qty
 
-            # 查找或创建商品
-            existing = ProductModel.get_by_sku(sku)
-            if existing:
-                prod_id = existing['id']
-                ProductModel.update(prod_id, name, sku, category_id, supplier_id, unit,
-                                    item.get('specification', ''), notes)
-            else:
-                prod_id = ProductModel.create(name, sku, category_id, supplier_id, unit,
-                                              item.get('specification', ''), notes)
-
-            # 入库
-            old_inv = db.query_one("SELECT quantity FROM inventory WHERE product_id = %s", (prod_id,))
-            old_qty = old_inv['quantity'] if old_inv else 0
-            new_qty = old_qty + qty
-
-            db.execute(
-                """INSERT INTO inventory (product_id, quantity) VALUES (%s, %s)
-                   ON DUPLICATE KEY UPDATE quantity = %s""",
-                (prod_id, new_qty, new_qty)
-            )
-            item_price = float(item.get('price', 0) or 0)
-            db.execute(
-                """INSERT INTO transactions
-                   (product_id, type, quantity, unit_price, supplier_id, before_qty, after_qty, batch_no, operator, notes)
-                   VALUES (%s, 'in', %s, %s, %s, %s, %s, %s, %s, %s)""",
-                (prod_id, qty, item_price, supplier_id, old_qty, new_qty, 'AI智能导入', 'AI', notes))
-            imported.append({'name': name, 'sku': sku, 'quantity': qty})
+                db.execute(
+                    """INSERT INTO inventory (product_id, quantity) VALUES (%s, %s)
+                       ON DUPLICATE KEY UPDATE quantity = %s""",
+                    (prod_id, new_qty, new_qty)
+                )
+                item_price = _to_float(item.get('price'))
+                db.execute(
+                    """INSERT INTO transactions
+                       (product_id, type, quantity, unit_price, supplier_id, before_qty, after_qty, batch_no, operator, notes)
+                       VALUES (%s, 'in', %s, %s, %s, %s, %s, %s, %s, %s)""",
+                    (prod_id, qty, item_price, supplier_id, old_qty, new_qty, 'AI智能导入', 'AI', notes))
+                imported.append({'name': name, 'sku': sku, 'quantity': qty})
 
         return jsonify({
             'success': True,
@@ -1105,6 +1249,9 @@ def api_ai_smart_import():
     except json.JSONDecodeError as e:
         _logger.error(f"AI 解析失败: {traceback.format_exc()}")
         return jsonify({'success': False, 'error': f'AI 解析结果格式错误，请重新描述: {str(e)}'}), 400
+    except ValueError as e:
+        _logger.error(f"AI 解析失败: {traceback.format_exc()}")
+        return jsonify({'success': False, 'error': str(e)}), 400
     except Exception as e:
         _logger.error(f"智能导入错误: {traceback.format_exc()}")
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -1122,130 +1269,170 @@ def api_ai_chat():
         result = ai_service.chat(message)
         actions, reply = ai_service.parse_actions(result)
 
-        # 执行 AI 指令
+        # 执行 AI 指令（每个动作独立容错，失败不会中断整轮，也不会留下 500）
         log = []
         if actions:
             for act in actions:
-                action_type = act.get('action', '')
-                sku = act.get('sku', '').strip()
-                qty = int(act.get('quantity', 0))
-                notes = act.get('notes', '')
+                try:
+                    if not isinstance(act, dict):
+                        continue
+                    action_type = act.get('action', '')
+                    sku = _clean_cell(act.get('sku'))
+                    qty = _to_int(act.get('quantity'))
+                    notes = _clean_cell(act.get('notes'))
 
-                # 供应商/客户操作（不需 sku/quantity）
-                if action_type == 'add_supplier':
-                    name_s = act.get('name', '').strip()
-                    if name_s:
-                        SupplierModel.create(name_s, act.get('contact', ''), act.get('phone', ''))
-                        log.append(f"新增供应商: {name_s}")
-                    continue
-                if action_type == 'add_customer':
-                    name_c = act.get('name', '').strip()
-                    if name_c:
-                        CustomerModel.create(name_c, act.get('contact', ''), act.get('phone', ''))
-                        log.append(f"新增客户: {name_c}")
-                    continue
+                    # 供应商/客户操作（不需 sku/quantity）
+                    if action_type == 'add_supplier':
+                        name_s = _clean_cell(act.get('name'))
+                        if name_s:
+                            SupplierModel.create(name_s, act.get('contact', ''), act.get('phone', ''))
+                            log.append(f"新增供应商: {name_s}")
+                        continue
+                    if action_type == 'add_customer':
+                        name_c = _clean_cell(act.get('name'))
+                        if name_c:
+                            CustomerModel.create(name_c, act.get('contact', ''), act.get('phone', ''))
+                            log.append(f"新增客户: {name_c}")
+                        continue
 
-                if action_type == 'create_order':
-                    # AI 创建出库单
-                    cust_name = act.get('customer', '')
-                    op = act.get('operator', 'AI')
-                    keeper = act.get('keeper', '')
-                    wh = act.get('warehouse', '')
-                    order_items = act.get('items', [])
-                    # 处理客户
-                    cid = None
-                    if cust_name:
-                        custs = CustomerModel.get_all()
-                        cmap = {c['name']: c['id'] for c in custs}
-                        if cust_name in cmap:
-                            cid = cmap[cust_name]
-                        else:
-                            cid = CustomerModel.create(cust_name)
-                    # 逐项出库
-                    done = []
-                    for oi in order_items:
-                        sku = oi.get('sku', '').strip()
-                        qty = int(oi.get('quantity', 0))
-                        price = float(oi.get('price', 0) or 0)
-                        prod = ProductModel.get_by_sku(sku)
-                        if prod and qty > 0:
-                            InventoryModel.stock_out(prod['id'], qty, 'AI出库单', op,
-                                                     customer_id=cid, unit_price=price)
-                            done.append({'name': prod['name'], 'sku': sku, 'quantity': qty,
-                                         'sale_price': price, 'specification': prod.get('specification', '')})
-                    # 生成 Excel
-                    import openpyxl
-                    from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
-                    from io import BytesIO
-                    from flask import send_file
-                    now_str = datetime.now().strftime('%Y-%m-%d')
-                    wb = openpyxl.Workbook(); ws = wb.active; ws.title = '出库单'
-                    tf = Font(size=16, bold=True); hf = Font(color='FFFFFF', bold=True, size=11)
-                    hfill = PatternFill(start_color='2563EB', end_color='2563EB', fill_type='solid')
-                    bd = Border(left=Side(style='thin'), right=Side(style='thin'),
-                                top=Side(style='thin'), bottom=Side(style='thin'))
-                    ca = Alignment(horizontal='center', vertical='center')
-                    ra = Alignment(horizontal='right', vertical='center')
-                    la = Alignment(horizontal='left', vertical='center')
-                    ws.merge_cells('A1:G1'); ws['A1'] = '出 库 单'; ws['A1'].font = tf; ws['A1'].alignment = ca
-                    ws.cell(row=2, column=1, value='日期:').alignment = ra
-                    ws.cell(row=2, column=2, value=now_str).alignment = la
-                    ws.cell(row=2, column=4, value='客户:').alignment = ra
-                    ws.cell(row=2, column=5, value=cust_name).alignment = la
-                    for ci, h in enumerate(['序号','商品名称','规格','SKU','数量','单价(元)','金额(元)'], 1):
-                        c = ws.cell(row=3, column=ci, value=h); c.fill = hfill; c.font = hf; c.alignment = ca; c.border = bd
-                    total = 0
-                    for idx, oi in enumerate(done, 1):
-                        r = 3 + idx; sub = round(oi['sale_price'] * oi['quantity'], 2); total += sub
-                        for ci, v in enumerate([idx, oi['name'], oi['specification'], oi['sku'],
-                                                 oi['quantity'], oi['sale_price'], sub], 1):
-                            c = ws.cell(row=r, column=ci, value=v); c.border = bd
-                            c.alignment = ca if ci < 6 else ra
-                    sr = 3 + len(done) + 1
-                    ws.merge_cells(f'A{sr}:E{sr}'); ws.cell(row=sr, column=1, value='合计').font = Font(bold=True)
-                    ws.cell(row=sr, column=1).alignment = ra
-                    tc = ws.cell(row=sr, column=7, value=total); tc.font = Font(bold=True, color='FF0000')
-                    tc.border = bd; tc.alignment = ra
-                    bot = sr + 1
-                    ws.cell(row=bot, column=1, value='经办人:').alignment = ra
-                    ws.cell(row=bot, column=2, value=op).alignment = la
-                    ws.cell(row=bot, column=4, value='库管:').alignment = ra
-                    ws.cell(row=bot, column=5, value=keeper).alignment = la
-                    ws.cell(row=bot+1, column=1, value='仓库编号:').alignment = ra
-                    ws.cell(row=bot+1, column=2, value=wh).alignment = la
-                    for i, w in enumerate([6,22,20,15,8,12,12], 1):
-                        ws.column_dimensions[chr(64+i)].width = w
-                    fname = f"出库单_{cust_name}_{now_str}.xlsx"
-                    fpath = os.path.join(UPLOAD_FOLDER, fname)
-                    wb.save(fpath)
-                    log.append(f"出库单: {cust_name}, {len(done)}项, 合计¥{total}")
-                    reply = (reply or '出库单已创建') + f'\n\n📥 [点击下载出库单](/uploads/{fname})'
-                    continue
+                    if action_type == 'create_order':
+                        # AI 创建出库单：先预检全部商品，全部通过才在事务里扣减，杜绝部分出库
+                        cust_name = (act.get('customer') or '').strip()
+                        op = act.get('operator') or 'AI'
+                        keeper = act.get('keeper') or ''
+                        wh = act.get('warehouse') or ''
+                        order_items = act.get('items') or []
+                        if not isinstance(order_items, list):
+                            order_items = []
+                        # 处理客户
+                        cid = None
+                        if cust_name:
+                            custs = CustomerModel.get_all()
+                            cmap = {c['name']: c['id'] for c in custs}
+                            if cust_name in cmap:
+                                cid = cmap[cust_name]
+                            else:
+                                cid = CustomerModel.create(cust_name)
 
-                if action_type == 'smart_import':
-                    items = ai_service.smart_import(act.get('text', ''))
-                    for item in items:
-                        _do_ai_stock_in(item.get('sku', ''), int(item.get('quantity', 0)),
-                                       item.get('name', ''), item.get('notes', ''))
-                        log.append(f"智能导入: {item['name']} +{item['quantity']}")
-                    continue
+                        # 预检
+                        plan = []
+                        problems = []
+                        for oi in order_items:
+                            if not isinstance(oi, dict):
+                                continue
+                            sku_i = _clean_cell(oi.get('sku'))
+                            qty_i = _to_int(oi.get('quantity'))
+                            price_i = _to_float(oi.get('price'))
+                            prod = ProductModel.get_by_sku(sku_i) if sku_i else None
+                            if not prod:
+                                problems.append(f"商品不存在: {sku_i or '(空)'}")
+                                continue
+                            if qty_i is None or qty_i <= 0:
+                                problems.append(f"数量无效: {prod['name']}")
+                                continue
+                            inv = db.query_one("SELECT quantity FROM inventory WHERE product_id=%s", (prod['id'],))
+                            avail = inv['quantity'] if inv else 0
+                            if avail < qty_i:
+                                problems.append(f"库存不足: {prod['name']} 当前{avail} 需{qty_i}")
+                                continue
+                            plan.append((prod, sku_i, qty_i, price_i))
 
-                if not sku or qty <= 0:
-                    continue
+                        if problems:
+                            log.append("出库单未执行: " + "；".join(problems))
+                            continue
 
-                if action_type == 'stock_in':
-                    _do_ai_stock_in(sku, qty, act.get('name', ''),
-                                    unit=act.get('unit', ''), category_name=act.get('category', ''),
-                                    supplier_name=act.get('supplier', ''))
-                    log.append(f"入库: {sku} +{qty}")
-                elif action_type == 'stock_out':
-                    _do_ai_stock_out(sku, qty, notes)
-                    log.append(f"出库: {sku} -{qty}")
-                elif action_type == 'set_quantity':
-                    _do_ai_set_quantity(sku, qty, notes)
-                    log.append(f"调库: {sku} = {qty}")
-                else:
-                    log.append(f"未知操作: {action_type}")
+                        # 全部通过 → 事务内扣减
+                        done = []
+                        with db.transaction():
+                            for prod, sku_i, qty_i, price_i in plan:
+                                InventoryModel.stock_out(prod['id'], qty_i, 'AI出库单', op,
+                                                         customer_id=cid, unit_price=price_i)
+                                done.append({'name': prod['name'], 'sku': sku_i, 'quantity': qty_i,
+                                             'sale_price': price_i, 'specification': prod.get('specification', '')})
+                        # 生成 Excel
+                        import openpyxl
+                        from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
+                        from io import BytesIO
+                        now_str = datetime.now().strftime('%Y-%m-%d')
+                        wb = openpyxl.Workbook(); ws = wb.active; ws.title = '出库单'
+                        tf = Font(size=16, bold=True); hf = Font(color='FFFFFF', bold=True, size=11)
+                        hfill = PatternFill(start_color='2563EB', end_color='2563EB', fill_type='solid')
+                        bd = Border(left=Side(style='thin'), right=Side(style='thin'),
+                                    top=Side(style='thin'), bottom=Side(style='thin'))
+                        ca = Alignment(horizontal='center', vertical='center')
+                        ra = Alignment(horizontal='right', vertical='center')
+                        la = Alignment(horizontal='left', vertical='center')
+                        ws.merge_cells('A1:G1'); ws['A1'] = '出 库 单'; ws['A1'].font = tf; ws['A1'].alignment = ca
+                        ws.cell(row=2, column=1, value='日期:').alignment = ra
+                        ws.cell(row=2, column=2, value=now_str).alignment = la
+                        ws.cell(row=2, column=4, value='客户:').alignment = ra
+                        ws.cell(row=2, column=5, value=cust_name).alignment = la
+                        for ci, h in enumerate(['序号','商品名称','规格','SKU','数量','单价(元)','金额(元)'], 1):
+                            c = ws.cell(row=3, column=ci, value=h); c.fill = hfill; c.font = hf; c.alignment = ca; c.border = bd
+                        total = 0
+                        for idx, oi in enumerate(done, 1):
+                            r = 3 + idx; sub = round(oi['sale_price'] * oi['quantity'], 2); total += sub
+                            for ci, v in enumerate([idx, oi['name'], oi['specification'], oi['sku'],
+                                                     oi['quantity'], oi['sale_price'], sub], 1):
+                                c = ws.cell(row=r, column=ci, value=v); c.border = bd
+                                c.alignment = ca if ci < 6 else ra
+                        sr = 3 + len(done) + 1
+                        ws.merge_cells(f'A{sr}:E{sr}'); ws.cell(row=sr, column=1, value='合计').font = Font(bold=True)
+                        ws.cell(row=sr, column=1).alignment = ra
+                        tc = ws.cell(row=sr, column=7, value=total); tc.font = Font(bold=True, color='FF0000')
+                        tc.border = bd; tc.alignment = ra
+                        bot = sr + 1
+                        ws.cell(row=bot, column=1, value='经办人:').alignment = ra
+                        ws.cell(row=bot, column=2, value=op).alignment = la
+                        ws.cell(row=bot, column=4, value='库管:').alignment = ra
+                        ws.cell(row=bot, column=5, value=keeper).alignment = la
+                        ws.cell(row=bot+1, column=1, value='仓库编号:').alignment = ra
+                        ws.cell(row=bot+1, column=2, value=wh).alignment = la
+                        for i, w in enumerate([6,22,20,15,8,12,12], 1):
+                            ws.column_dimensions[chr(64+i)].width = w
+                        safe_cust = _safe_filename_part(cust_name)
+                        fname = f"出库单_{safe_cust}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+                        fpath = os.path.join(UPLOAD_FOLDER, fname)
+                        wb.save(fpath)
+                        log.append(f"出库单: {cust_name}, {len(done)}项, 合计¥{total}")
+                        reply = (reply or '出库单已创建') + f'\n\n📥 [点击下载出库单](/uploads/{fname})'
+                        continue
+
+                    if action_type == 'smart_import':
+                        items = ai_service.smart_import(act.get('text', ''))
+                        if not isinstance(items, list):
+                            log.append("智能导入: AI 返回格式异常")
+                            continue
+                        for item in items:
+                            if not isinstance(item, dict):
+                                continue
+                            qty_imp = _to_int(item.get('quantity'))
+                            if qty_imp is None or qty_imp <= 0:
+                                continue
+                            _do_ai_stock_in(_clean_cell(item.get('sku')), qty_imp,
+                                            _clean_cell(item.get('name')), _clean_cell(item.get('notes')))
+                            log.append(f"智能导入: {item.get('name')} +{qty_imp}")
+                        continue
+
+                    if not sku or qty is None or qty <= 0:
+                        continue
+
+                    if action_type == 'stock_in':
+                        _do_ai_stock_in(sku, qty, act.get('name', ''),
+                                        unit=act.get('unit', ''), category_name=act.get('category', ''),
+                                        supplier_name=act.get('supplier', ''))
+                        log.append(f"入库: {sku} +{qty}")
+                    elif action_type == 'stock_out':
+                        _do_ai_stock_out(sku, qty, notes)
+                        log.append(f"出库: {sku} -{qty}")
+                    elif action_type == 'set_quantity':
+                        _do_ai_set_quantity(sku, qty, notes)
+                        log.append(f"调库: {sku} = {qty}")
+                    else:
+                        log.append(f"未知操作: {action_type}")
+                except Exception as e:
+                    _logger.error(f"AI 动作执行失败: {traceback.format_exc()}")
+                    log.append(f"操作执行失败: {str(e)}")
 
         reply = reply or result
         if log:

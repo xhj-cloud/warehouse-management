@@ -392,7 +392,10 @@ OCR 识别文字：
         # 宽松解析：修复常见问题
         raw = _re.sub(r',\s*]', ']', raw)  # 去掉尾逗号
         raw = _re.sub(r',\s*}', '}', raw)
-        return json.loads(raw)
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            raise ValueError("AI 解析结果格式错误，请重新描述或换一种说法")
 
     def health_check(self):
         """检查 LM Studio 服务是否可用"""
