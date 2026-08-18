@@ -16,8 +16,10 @@ from tests.fake_db import FakeDB
 #  _clean_value：查询结果类型清洗
 # ==========================================
 class TestCleanValue:
-    def test_decimal_to_float(self):
-        assert models_mod._clean_value(decimal.Decimal('1.5')) == 1.5
+    def test_decimal_kept_as_is(self):
+        """回归：DECIMAL 保持 Decimal 精确类型（不再转 float），JSON 序列化由 CustomJSONProvider 负责"""
+        d = decimal.Decimal('1.5')
+        assert models_mod._clean_value(d) is d
 
     def test_datetime_to_isoformat(self):
         dt = datetime(2026, 7, 13, 10, 30, 0)
@@ -31,7 +33,10 @@ class TestCleanValue:
 
     def test_nested_dict_and_list(self):
         data = {'a': [decimal.Decimal('2'), date(2026, 1, 1)], 'b': b'x'}
-        assert models_mod._clean_value(data) == {'a': [2.0, '2026-01-01'], 'b': 'x'}
+        result = models_mod._clean_value(data)
+        assert isinstance(result['a'][0], decimal.Decimal) and result['a'][0] == decimal.Decimal('2')
+        assert result['a'][1] == '2026-01-01'
+        assert result['b'] == 'x'
 
     def test_plain_values_unchanged(self):
         for v in (42, 3.14, 'text', None, True):
@@ -201,3 +206,53 @@ class TestTransactionStats:
         assert captured['params'] == (7,)
         assert 'INTERVAL' in captured['sql']
         assert result[0]['total_in'] == 5
+
+
+# ==========================================
+#  低库存条件：列表页与仪表盘必须同口径
+# ==========================================
+class TestLowStockCondition:
+    def test_get_low_stock_uses_per_product_threshold_with_fallback(self, monkeypatch):
+        """回归：优先商品自己的 min_stock，未设置时回退全局阈值（不再有 OR 双条件误报）"""
+        db = FakeDB()
+        monkeypatch.setattr(models_mod, 'db', db)
+
+        models_mod.InventoryModel.get_low_stock()
+
+        sql, params = db.queries[0]
+        assert 'IF(i.min_stock > 0, i.min_stock' in sql
+        assert 'i.min_stock OR' not in sql   # 旧的双条件已移除
+        assert params == (models_mod.DEFAULT_LOW_STOCK_THRESHOLD,)
+
+    def test_get_low_stock_custom_threshold(self, monkeypatch):
+        db = FakeDB()
+        monkeypatch.setattr(models_mod, 'db', db)
+
+        models_mod.InventoryModel.get_low_stock(25)
+
+        sql, params = db.queries[0]
+        assert params == (25,)
+
+    def test_dashboard_low_stock_matches_list_condition(self, monkeypatch):
+        """回归：仪表盘低库存计数与列表页同一条件，否则两处数字对不上"""
+        db = FakeDB()
+        db.one_side_effect = lambda sql, params=None: {'cnt': 0}
+        monkeypatch.setattr(models_mod, 'db', db)
+
+        models_mod.StatsModel.get_dashboard()
+
+        hits = db.find_queried('COUNT(*) AS cnt FROM inventory')
+        assert len(hits) == 1
+        sql, params = hits[0]
+        assert 'IF(min_stock > 0, min_stock' in sql
+        assert params == (models_mod.DEFAULT_LOW_STOCK_THRESHOLD,)
+
+
+# ==========================================
+#  DECIMAL 精度：DB 层不再转 float
+# ==========================================
+class TestDecimalPrecision:
+    def test_database_config_has_no_float_conversion(self):
+        """回归：DECIMAL 列保持 Decimal 类型，连接配置里不再有全局 float 转换"""
+        d = models_mod.Database()
+        assert 'conv' not in d.config

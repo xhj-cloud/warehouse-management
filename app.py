@@ -479,9 +479,10 @@ def api_suppliers():
 def api_supplier_create():
     try:
         d = request.json
-        sid = SupplierModel.create(d['name'], d.get('contact_person', ''), d.get('phone', ''),
-                                    d.get('email', ''), d.get('address', ''), d.get('notes', ''))
-        AuditLog.log('create', 'suppliers', sid, new_data=d, operator='管理员')
+        with db.transaction():
+            sid = SupplierModel.create(d['name'], d.get('contact_person', ''), d.get('phone', ''),
+                                        d.get('email', ''), d.get('address', ''), d.get('notes', ''))
+            AuditLog.log('create', 'suppliers', sid, new_data=d, operator='管理员')
         return jsonify({'success': True, 'id': sid})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 400
@@ -490,10 +491,11 @@ def api_supplier_create():
 def api_supplier_update(sid):
     try:
         d = request.json
-        old = SupplierModel.get_by_id(sid)
-        SupplierModel.update(sid, d['name'], d.get('contact_person', ''), d.get('phone', ''),
-                             d.get('email', ''), d.get('address', ''), d.get('notes', ''))
-        AuditLog.log('update', 'suppliers', sid, old_data=old, new_data=d, operator='管理员')
+        with db.transaction():
+            old = SupplierModel.get_by_id(sid)
+            SupplierModel.update(sid, d['name'], d.get('contact_person', ''), d.get('phone', ''),
+                                 d.get('email', ''), d.get('address', ''), d.get('notes', ''))
+            AuditLog.log('update', 'suppliers', sid, old_data=old, new_data=d, operator='管理员')
         return jsonify({'success': True})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 400
@@ -501,9 +503,10 @@ def api_supplier_update(sid):
 @app.route('/api/suppliers/<int:sid>', methods=['DELETE'])
 def api_supplier_delete(sid):
     try:
-        old = SupplierModel.get_by_id(sid)
-        SupplierModel.delete(sid)
-        AuditLog.log('delete', 'suppliers', sid, old_data=old, operator='管理员')
+        with db.transaction():
+            old = SupplierModel.get_by_id(sid)
+            SupplierModel.delete(sid)
+            AuditLog.log('delete', 'suppliers', sid, old_data=old, operator='管理员')
         return jsonify({'success': True})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 400
@@ -524,9 +527,10 @@ def api_customers():
 def api_customer_create():
     try:
         d = request.json
-        cid = CustomerModel.create(d['name'], d.get('contact_person', ''), d.get('phone', ''),
-                                    d.get('email', ''), d.get('address', ''), d.get('notes', ''))
-        AuditLog.log('create', 'customers', cid, new_data=d, operator='管理员')
+        with db.transaction():
+            cid = CustomerModel.create(d['name'], d.get('contact_person', ''), d.get('phone', ''),
+                                        d.get('email', ''), d.get('address', ''), d.get('notes', ''))
+            AuditLog.log('create', 'customers', cid, new_data=d, operator='管理员')
         return jsonify({'success': True, 'id': cid})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 400
@@ -535,10 +539,11 @@ def api_customer_create():
 def api_customer_update(cid):
     try:
         d = request.json
-        old = CustomerModel.get_by_id(cid)
-        CustomerModel.update(cid, d['name'], d.get('contact_person', ''), d.get('phone', ''),
-                             d.get('email', ''), d.get('address', ''), d.get('notes', ''))
-        AuditLog.log('update', 'customers', cid, old_data=old, new_data=d, operator='管理员')
+        with db.transaction():
+            old = CustomerModel.get_by_id(cid)
+            CustomerModel.update(cid, d['name'], d.get('contact_person', ''), d.get('phone', ''),
+                                 d.get('email', ''), d.get('address', ''), d.get('notes', ''))
+            AuditLog.log('update', 'customers', cid, old_data=old, new_data=d, operator='管理员')
         return jsonify({'success': True})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 400
@@ -546,9 +551,10 @@ def api_customer_update(cid):
 @app.route('/api/customers/<int:cid>', methods=['DELETE'])
 def api_customer_delete(cid):
     try:
-        old = CustomerModel.get_by_id(cid)
-        CustomerModel.delete(cid)
-        AuditLog.log('delete', 'customers', cid, old_data=old, operator='管理员')
+        with db.transaction():
+            old = CustomerModel.get_by_id(cid)
+            CustomerModel.delete(cid)
+            AuditLog.log('delete', 'customers', cid, old_data=old, operator='管理员')
         return jsonify({'success': True})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 400
@@ -588,40 +594,42 @@ def api_product_create():
     """创建商品"""
     try:
         data = request.json
-        prod_id = ProductModel.create(
-            name=data['name'],
-            sku=data['sku'],
-            category_id=data.get('category_id'),
-            supplier_id=data.get('supplier_id'),
-            unit=data.get('unit', '个'),
-            specification=data.get('specification', ''),
-            description=data.get('description', ''),
-            unit_price=float(data.get('unit_price', 0) or 0),
-            sale_price=float(data.get('sale_price', 0) or 0),
-        )
-        # 初始库存走 stock_in（生成入库流水），数量缺失/为 0 时跳过
+        # 先校验数量，避免负数时「商品已创建落库却返回 400」的半截写
         qty = _to_int(data.get('quantity'))
         if qty is not None and qty < 0:
             return jsonify({'success': False, 'error': '数量不能为负数'}), 400
-        if qty is not None and qty > 0:
-            InventoryModel.stock_in(
-                prod_id,
-                quantity=qty,
-                operator='初始创建',
-                notes='新建商品初始库存',
-                unit_price=float(data.get('unit_price', 0) or 0),
+        with db.transaction():
+            prod_id = ProductModel.create(
+                name=data['name'],
+                sku=data['sku'],
+                category_id=data.get('category_id'),
                 supplier_id=data.get('supplier_id'),
+                unit=data.get('unit', '个'),
+                specification=data.get('specification', ''),
+                description=data.get('description', ''),
+                unit_price=float(data.get('unit_price', 0) or 0),
+                sale_price=float(data.get('sale_price', 0) or 0),
             )
-        # 库位/阈值无条件写入（ProductModel.create 已保证库存行存在），
-        # 修复「不填初始库存时库位/最低/最高库存全部丢失」的问题
-        db.execute(
-            "UPDATE inventory SET location=%s, min_stock=%s, max_stock=%s WHERE product_id=%s",
-            (_clean_cell(data.get('location')),
-             _to_int(data.get('min_stock')) or 0,
-             _to_int(data.get('max_stock')) or 9999,
-             prod_id)
-        )
-        AuditLog.log('create', 'products', prod_id, new_data=data, operator='管理员')
+            # 初始库存走 stock_in（生成入库流水），数量缺失/为 0 时跳过
+            if qty is not None and qty > 0:
+                InventoryModel.stock_in(
+                    prod_id,
+                    quantity=qty,
+                    operator='初始创建',
+                    notes='新建商品初始库存',
+                    unit_price=float(data.get('unit_price', 0) or 0),
+                    supplier_id=data.get('supplier_id'),
+                )
+            # 库位/阈值无条件写入（ProductModel.create 已保证库存行存在），
+            # 修复「不填初始库存时库位/最低/最高库存全部丢失」的问题
+            db.execute(
+                "UPDATE inventory SET location=%s, min_stock=%s, max_stock=%s WHERE product_id=%s",
+                (_clean_cell(data.get('location')),
+                 _to_int(data.get('min_stock')) or 0,
+                 _to_int(data.get('max_stock')) or 9999,
+                 prod_id)
+            )
+            AuditLog.log('create', 'products', prod_id, new_data=data, operator='管理员')
         return jsonify({'success': True, 'id': prod_id})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 400
@@ -632,26 +640,27 @@ def api_product_update(prod_id):
     """更新商品（含库存信息）"""
     try:
         data = request.json
-        old = ProductModel.get_by_id(prod_id)
-        ProductModel.update(
-            prod_id,
-            name=data['name'],
-            sku=data['sku'],
-            category_id=data.get('category_id'),
-            supplier_id=data.get('supplier_id'),
-            unit=data.get('unit', '个'),
-            specification=data.get('specification', ''),
-            description=data.get('description', ''),
-            unit_price=float(data.get('unit_price', 0) or 0),
-            sale_price=float(data.get('sale_price', 0) or 0),
-        )
-        AuditLog.log('update', 'products', prod_id, old_data=old, new_data=data, operator='管理员')
-        # 同步更新库存信息（数量变化走出入库流水，保留审计）
+        # 先校验数量，避免负数时「商品字段已更新落库却返回 400」的半截写
         new_qty = _to_int(data.get('quantity'))
-        if new_qty is not None:
-            if new_qty < 0:
-                return jsonify({'success': False, 'error': '数量不能为负数'}), 400
-            with db.transaction():
+        if new_qty is not None and new_qty < 0:
+            return jsonify({'success': False, 'error': '数量不能为负数'}), 400
+        with db.transaction():
+            old = ProductModel.get_by_id(prod_id)
+            ProductModel.update(
+                prod_id,
+                name=data['name'],
+                sku=data['sku'],
+                category_id=data.get('category_id'),
+                supplier_id=data.get('supplier_id'),
+                unit=data.get('unit', '个'),
+                specification=data.get('specification', ''),
+                description=data.get('description', ''),
+                unit_price=float(data.get('unit_price', 0) or 0),
+                sale_price=float(data.get('sale_price', 0) or 0),
+            )
+            AuditLog.log('update', 'products', prod_id, old_data=old, new_data=data, operator='管理员')
+            # 同步更新库存信息（数量变化走出入库流水，保留审计）
+            if new_qty is not None:
                 _apply_inventory_change(
                     prod_id, new_qty,
                     location=_clean_cell(data.get('location')),
@@ -667,9 +676,10 @@ def api_product_update(prod_id):
 def api_product_delete(prod_id):
     """删除商品"""
     try:
-        old = ProductModel.get_by_id(prod_id)
-        ProductModel.delete(prod_id)
-        AuditLog.log('delete', 'products', prod_id, old_data=old, operator='管理员')
+        with db.transaction():
+            old = ProductModel.get_by_id(prod_id)
+            ProductModel.delete(prod_id)
+            AuditLog.log('delete', 'products', prod_id, old_data=old, operator='管理员')
         return jsonify({'success': True})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 400
@@ -730,24 +740,25 @@ def api_stock_in():
         data = request.json
         up = float(data.get('unit_price', 0) or 0)
         sid = data.get('supplier_id')
-        InventoryModel.stock_in(
-            product_id=int(data['product_id']),
-            quantity=int(data['quantity']),
-            batch_no=data.get('batch_no', ''),
-            operator=data.get('operator', ''),
-            notes=data.get('notes', ''),
-            unit_price=up,
-            supplier_id=sid,
-        )
-        # 更新商品最近进价和供应商
         pid = int(data['product_id'])
-        if up > 0:
-            db.execute("UPDATE products SET unit_price=%s WHERE id=%s", (up, pid))
-        if sid:
-            db.execute("UPDATE products SET supplier_id=%s WHERE id=%s", (sid, pid))
-        AuditLog.log('stock_in', 'inventory', int(data['product_id']),
-                     new_data={'qty': int(data['quantity']), 'unit_price': up, 'supplier_id': sid},
-                     operator=data.get('operator', ''))
+        with db.transaction():
+            InventoryModel.stock_in(
+                product_id=pid,
+                quantity=int(data['quantity']),
+                batch_no=data.get('batch_no', ''),
+                operator=data.get('operator', ''),
+                notes=data.get('notes', ''),
+                unit_price=up,
+                supplier_id=sid,
+            )
+            # 更新商品最近进价和供应商
+            if up > 0:
+                db.execute("UPDATE products SET unit_price=%s WHERE id=%s", (up, pid))
+            if sid:
+                db.execute("UPDATE products SET supplier_id=%s WHERE id=%s", (sid, pid))
+            AuditLog.log('stock_in', 'inventory', pid,
+                         new_data={'qty': int(data['quantity']), 'unit_price': up, 'supplier_id': sid},
+                         operator=data.get('operator', ''))
         return jsonify({'success': True, 'message': '入库成功'})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 400
@@ -758,18 +769,19 @@ def api_stock_out():
     """出库"""
     try:
         data = request.json
-        InventoryModel.stock_out(
-            product_id=int(data['product_id']),
-            quantity=int(data['quantity']),
-            batch_no=data.get('batch_no', ''),
-            operator=data.get('operator', ''),
-            notes=data.get('notes', ''),
-            customer_id=data.get('customer_id'),
-            unit_price=float(data.get('unit_price', 0) or 0),
-        )
-        AuditLog.log('stock_out', 'inventory', int(data['product_id']),
-                     new_data={'qty': int(data['quantity']), 'customer_id': data.get('customer_id')},
-                     operator=data.get('operator', ''))
+        with db.transaction():
+            InventoryModel.stock_out(
+                product_id=int(data['product_id']),
+                quantity=int(data['quantity']),
+                batch_no=data.get('batch_no', ''),
+                operator=data.get('operator', ''),
+                notes=data.get('notes', ''),
+                customer_id=data.get('customer_id'),
+                unit_price=float(data.get('unit_price', 0) or 0),
+            )
+            AuditLog.log('stock_out', 'inventory', int(data['product_id']),
+                         new_data={'qty': int(data['quantity']), 'customer_id': data.get('customer_id')},
+                         operator=data.get('operator', ''))
         return jsonify({'success': True, 'message': '出库成功'})
     except ValueError as e:
         return jsonify({'success': False, 'error': str(e)}), 400

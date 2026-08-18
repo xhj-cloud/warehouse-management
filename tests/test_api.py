@@ -94,11 +94,12 @@ class TestCategories:
 #  供应商 / 客户 API（含审计日志）
 # ==========================================
 class TestSuppliers:
-    def test_create_records_audit(self, app_mod, client, monkeypatch):
+    def test_create_records_audit(self, app_mod, client, fake_db, monkeypatch):
         create = make_recorder(8)
         audit = make_recorder(None)
         monkeypatch.setattr(app_mod.SupplierModel, 'create', create)
         monkeypatch.setattr(app_mod.AuditLog, 'log', audit)
+        monkeypatch.setattr(app_mod, 'db', fake_db)
 
         resp = client.post('/api/suppliers', json={'name': '华强五金', 'contact_person': '张经理'})
         assert resp.status_code == 200
@@ -110,7 +111,7 @@ class TestSuppliers:
         assert (action, table, record_id) == ('create', 'suppliers', 8)
         assert audit.calls[0]['kwargs']['operator'] == '管理员'
 
-    def test_update_and_delete_record_audit(self, app_mod, client, monkeypatch):
+    def test_update_and_delete_record_audit(self, app_mod, client, fake_db, monkeypatch):
         get_by_id = make_recorder({'id': 1, 'name': '旧名'})
         upd = make_recorder(None)
         dele = make_recorder(None)
@@ -119,19 +120,52 @@ class TestSuppliers:
         monkeypatch.setattr(app_mod.SupplierModel, 'update', upd)
         monkeypatch.setattr(app_mod.SupplierModel, 'delete', dele)
         monkeypatch.setattr(app_mod.AuditLog, 'log', audit)
+        monkeypatch.setattr(app_mod, 'db', fake_db)
 
         assert client.put('/api/suppliers/1', json={'name': '新名'}).status_code == 200
         assert client.delete('/api/suppliers/1').status_code == 200
         actions = [c['args'][0] for c in audit.calls]
         assert actions == ['update', 'delete']
 
+    def test_create_audit_log_in_same_transaction(self, app_mod, client, fake_db, monkeypatch):
+        """回归：审计日志必须与主操作在同一事务内写入（同连接、一起提交/回滚）"""
+        create = make_recorder(8)
+        in_tx_at_audit = []
+
+        def spy(action, table_name, record_id, old_data=None, new_data=None, operator='system'):
+            in_tx_at_audit.append(fake_db.in_transaction)
+
+        monkeypatch.setattr(app_mod.SupplierModel, 'create', create)
+        monkeypatch.setattr(app_mod.AuditLog, 'log', spy)
+        monkeypatch.setattr(app_mod, 'db', fake_db)
+
+        resp = client.post('/api/suppliers', json={'name': '华强五金'})
+        assert resp.status_code == 200
+        assert in_tx_at_audit == [True]
+
+    def test_create_audit_failure_returns_error(self, app_mod, client, fake_db, monkeypatch):
+        """回归：审计日志写失败时接口必须报错（事务回滚），不能静默成功"""
+        create = make_recorder(8)
+
+        def boom(*a, **k):
+            raise RuntimeError('audit db down')
+
+        monkeypatch.setattr(app_mod.SupplierModel, 'create', create)
+        monkeypatch.setattr(app_mod.AuditLog, 'log', boom)
+        monkeypatch.setattr(app_mod, 'db', fake_db)
+
+        resp = client.post('/api/suppliers', json={'name': '华强五金'})
+        assert resp.status_code == 400
+        assert 'audit db down' in resp.get_json()['error']
+
 
 class TestCustomers:
-    def test_create_records_audit(self, app_mod, client, monkeypatch):
+    def test_create_records_audit(self, app_mod, client, fake_db, monkeypatch):
         create = make_recorder(4)
         audit = make_recorder(None)
         monkeypatch.setattr(app_mod.CustomerModel, 'create', create)
         monkeypatch.setattr(app_mod.AuditLog, 'log', audit)
+        monkeypatch.setattr(app_mod, 'db', fake_db)
 
         resp = client.post('/api/customers', json={'name': '中建公司'})
         assert resp.status_code == 200
@@ -175,8 +209,10 @@ class TestProducts:
         hits = fake_db.assert_executed('UPDATE inventory SET location')
         assert hits[0][1][:4] == ('A-01', 5, 9999, 9)
 
-    def test_create_missing_sku_returns_400(self, app_mod, client, monkeypatch):
-        monkeypatch.setattr(app_mod.ProductModel, 'create', make_recorder(1))
+    def test_create_missing_sku_returns_400(self, app_mod, client, fake_db, monkeypatch):
+        create = make_recorder(1)
+        monkeypatch.setattr(app_mod.ProductModel, 'create', create)
+        monkeypatch.setattr(app_mod, 'db', fake_db)
         resp = client.post('/api/products', json={'name': '没有SKU'})
         assert resp.status_code == 400
 
@@ -199,6 +235,39 @@ class TestProducts:
         # 但库位/阈值照常写入
         hits = fake_db.assert_executed('UPDATE inventory SET location')
         assert hits[0][1] == ('B-02', 20, 9999, 9)
+
+    def test_create_negative_quantity_rejected_before_write(self, app_mod, client, fake_db, monkeypatch):
+        """回归：负数量创建商品必须直接 400，且任何数据都不落库（此前商品已先落库）"""
+        create = make_recorder(9)
+        audit = make_recorder(None)
+        monkeypatch.setattr(app_mod.ProductModel, 'create', create)
+        monkeypatch.setattr(app_mod.AuditLog, 'log', audit)
+        monkeypatch.setattr(app_mod, 'db', fake_db)
+
+        resp = client.post('/api/products', json={
+            'name': '螺丝 M6', 'sku': 'S-1', 'quantity': -5,
+        })
+        assert resp.status_code == 400
+        assert '不能为负数' in resp.get_json()['error']
+        # 校验发生在任何写入之前：商品未创建、无审计日志
+        assert create.calls == []
+        assert audit.calls == []
+
+    def test_update_negative_quantity_rejected_before_write(self, app_mod, client, fake_db, monkeypatch):
+        """回归：负数量更新商品必须直接 400，且任何数据都不落库（此前字段已先更新）"""
+        upd = make_recorder(None)
+        audit = make_recorder(None)
+        monkeypatch.setattr(app_mod.ProductModel, 'get_by_id', make_recorder({'id': 1}))
+        monkeypatch.setattr(app_mod.ProductModel, 'update', upd)
+        monkeypatch.setattr(app_mod.AuditLog, 'log', audit)
+        monkeypatch.setattr(app_mod, 'db', fake_db)
+
+        resp = client.put('/api/products/1', json={
+            'name': '螺丝 M6', 'sku': 'S-1', 'quantity': -5,
+        })
+        assert resp.status_code == 400
+        assert upd.calls == []
+        assert audit.calls == []
 
 
 # ==========================================
@@ -234,16 +303,35 @@ class TestInventory:
         action, table, record_id = audit.calls[0]['args'][:3]
         assert (action, table, record_id) == ('stock_in', 'inventory', 7)
 
-    def test_stock_out_insufficient_returns_400(self, app_mod, client, monkeypatch):
+    def test_stock_out_insufficient_returns_400(self, app_mod, client, fake_db, monkeypatch):
         def boom(*a, **k):
             raise ValueError('库存不足！当前库存: 3, 需要出库: 10')
         monkeypatch.setattr(app_mod.InventoryModel, 'stock_out', boom)
+        monkeypatch.setattr(app_mod, 'db', fake_db)
 
         resp = client.post('/api/inventory/stock-out', json={
             'product_id': 7, 'quantity': 10,
         })
         assert resp.status_code == 400
         assert '库存不足' in resp.get_json()['error']
+
+
+# ==========================================
+#  DECIMAL 金额序列化
+# ==========================================
+class TestDecimalSerialization:
+    def test_decimal_serialized_as_json_number(self, app_mod, client, monkeypatch):
+        """回归：DECIMAL 金额字段经 CustomJSONProvider 输出为 JSON 数字（不再在 DB 层转 float）"""
+        from decimal import Decimal
+        rows = [{'id': 1, 'name': '螺丝', 'sku': 'S-1',
+                 'unit_price': Decimal('2.50'), 'sale_price': Decimal('3.75')}]
+        monkeypatch.setattr(app_mod.ProductModel, 'get_all', make_recorder(rows))
+
+        resp = client.get('/api/products')
+        assert resp.status_code == 200
+        data = resp.get_json()['data'][0]
+        assert data['unit_price'] == 2.5
+        assert data['sale_price'] == 3.75
 
 
 # ==========================================

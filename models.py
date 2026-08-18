@@ -6,16 +6,17 @@ import pymysql
 import decimal
 import json
 import threading
-from pymysql.constants import FIELD_TYPE
 from contextlib import contextmanager
 from config import MYSQL_CONFIG
 from datetime import datetime, date
 
 
 def _clean_value(obj):
-    """递归清洗查询结果中的 Decimal/bytes/date，确保 JSON 可序列化"""
-    if isinstance(obj, decimal.Decimal):
-        return float(obj)
+    """递归清洗查询结果中的 bytes/date，确保 JSON 可序列化。
+
+    Decimal 原样保留：金额运算保持精确十进制，最终由 app.py 的
+    CustomJSONProvider 在 jsonify 时转成数字输出。
+    """
     if isinstance(obj, (datetime, date)):
         return obj.isoformat()
     if isinstance(obj, bytes):
@@ -27,10 +28,14 @@ def _clean_value(obj):
     return obj
 
 
-# 让 pymysql 把 DECIMAL 直接转成 float
-_conversions = pymysql.converters.conversions.copy()
-_conversions[FIELD_TYPE.DECIMAL] = float
-_conversions[FIELD_TYPE.NEWDECIMAL] = float
+# DECIMAL 列保持 pymysql 默认的 Decimal 类型（不再转 float）：
+# 金额在 Python 侧参与运算时是精确十进制，避免二进制浮点误差累积；
+# JSON 输出由 app.py 的 CustomJSONProvider 统一序列化。
+
+# 低库存预警的全局兜底阈值：商品未设置 min_stock（<=0）时使用。
+# get_low_stock 与 StatsModel.get_dashboard 必须共用此口径，
+# 否则仪表盘计数和低库存列表页会对不上。
+DEFAULT_LOW_STOCK_THRESHOLD = 10
 
 
 class Database:
@@ -42,7 +47,7 @@ class Database:
     """
 
     def __init__(self):
-        self.config = {**MYSQL_CONFIG, 'conv': _conversions}
+        self.config = dict(MYSQL_CONFIG)
         self._local = threading.local()
 
     @contextmanager
@@ -244,14 +249,19 @@ class InventoryModel:
         return db.query(sql)
 
     @staticmethod
-    def get_low_stock(threshold=10):
+    def get_low_stock(threshold=DEFAULT_LOW_STOCK_THRESHOLD):
+        """低库存列表：优先用商品自己的 min_stock；未设置（<=0）时回退全局阈值。
+
+        条件必须与 StatsModel.get_dashboard() 保持一致，
+        否则仪表盘计数和低库存列表页会对不上。
+        """
         sql = """
             SELECT i.*, p.name AS product_name, p.sku, p.unit,
                    c.name AS category_name
             FROM inventory i
             JOIN products p ON i.product_id = p.id
             LEFT JOIN categories c ON p.category_id = c.id
-            WHERE i.quantity <= i.min_stock OR i.quantity <= %s
+            WHERE i.quantity <= IF(i.min_stock > 0, i.min_stock, %s)
             ORDER BY i.quantity ASC
         """
         return db.query(sql, (threshold,))
@@ -400,8 +410,11 @@ class StatsModel:
         total_products = db.query_one("SELECT COUNT(*) AS cnt FROM products")['cnt']
         total_categories = db.query_one("SELECT COUNT(*) AS cnt FROM categories")['cnt']
         total_quantity = db.query_one("SELECT COALESCE(SUM(quantity), 0) AS cnt FROM inventory")['cnt']
+        # 与 InventoryModel.get_low_stock 同一条件，保证仪表盘计数和列表页一致
         low_stock = db.query_one(
-            "SELECT COUNT(*) AS cnt FROM inventory WHERE quantity <= min_stock"
+            "SELECT COUNT(*) AS cnt FROM inventory "
+            "WHERE quantity <= IF(min_stock > 0, min_stock, %s)",
+            (DEFAULT_LOW_STOCK_THRESHOLD,)
         )['cnt']
         # 库存价值估算：数量 × 进货单价（unit_price），而非单纯的数量合计
         total_value_estimate = db.query_one(
