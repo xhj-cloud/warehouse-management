@@ -167,7 +167,8 @@ class TestSuppliers:
 
         action, table, record_id = audit.calls[0]['args'][:3]
         assert (action, table, record_id) == ('create', 'suppliers', 8)
-        assert audit.calls[0]['kwargs']['operator'] == '管理员'
+        # 操作者 = 登录账号；测试未登录（DISABLE_AUTH）→ 回退默认 '系统'
+        assert audit.calls[0]['kwargs']['operator'] == '系统'
 
     def test_update_and_delete_record_audit(self, app_mod, client, fake_db, monkeypatch):
         get_by_id = make_recorder({'id': 1, 'name': '旧名'})
@@ -1541,3 +1542,43 @@ class TestSessionLogin:
         resp = client.post('/api/login', json={'username': 'x', 'password': 'bad'})
         assert resp.status_code == 401
         assert '用户名或密码错误' in resp.get_json()['error']
+
+
+# ==========================================
+#  出入库操作者 = 登录账号
+# ==========================================
+class TestOperatorMatchesLogin:
+    def test_stock_in_operator_is_logged_in_user(self, app_mod, client, fake_db, monkeypatch):
+        """回归：登录账号为 xhj 时，stock-in 流水 operator 应为 xhj 而非'管理员'"""
+        # 模拟已登录用户 xhj（直接写 session；DISABLE_AUTH 下 before_request 不拦，但 _op 读 session）
+        with client.session_transaction() as sess:
+            sess['username'] = 'xhj'
+            sess['role'] = 'admin'
+
+        stock_in = make_recorder(None)
+        monkeypatch.setattr(app_mod.InventoryModel, 'stock_in', stock_in)
+        monkeypatch.setattr(app_mod, 'db', fake_db)
+        monkeypatch.setattr(app_mod.AuditLog, 'log', lambda *a, **k: None)
+
+        resp = client.post('/api/inventory/stock-in', json={
+            'product_id': 7, 'quantity': 5, 'unit_price': 2.5,
+        })
+        assert resp.status_code == 200
+        # InventoryModel.stock_in 收到的 operator 参数 = 登录账号 xhj
+        call = stock_in.calls[0]['kwargs']
+        assert call.get('operator') == 'xhj'
+
+    def test_stock_out_operator_is_logged_in_user(self, app_mod, client, fake_db, monkeypatch):
+        with client.session_transaction() as sess:
+            sess['username'] = 'xhj'
+            sess['role'] = 'admin'
+        stock_out = make_recorder(None)
+        monkeypatch.setattr(app_mod.InventoryModel, 'stock_out', stock_out)
+        monkeypatch.setattr(app_mod, 'db', fake_db)
+        monkeypatch.setattr(app_mod.AuditLog, 'log', lambda *a, **k: None)
+        resp = client.post('/api/inventory/stock-out', json={
+            'product_id': 7, 'quantity': 5, 'unit_price': 2.5,
+        })
+        assert resp.status_code == 200
+        call = stock_out.calls[0]['kwargs']
+        assert call.get('operator') == 'xhj'

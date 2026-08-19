@@ -404,7 +404,8 @@ async function quickStockIn(productId) {
 async function doStockIn(productId, quantity, supplierId, unitPrice) {
     supplierId = supplierId || null;
     unitPrice = unitPrice || 0;
-    var body = { product_id: productId, quantity: quantity, unit_price: unitPrice, operator: '管理员' };
+    // operator 由后端取登录账号（前端不传，防伪造），流水与账号对应
+    var body = { product_id: productId, quantity: quantity, unit_price: unitPrice };
     if (supplierId) body.supplier_id = supplierId;
     var result = await fetchAPI(API + '/inventory/stock-in', {
         method: 'POST',
@@ -453,7 +454,8 @@ async function quickStockOut(productId) {
 async function doStockOut(productId, quantity, customerId, unitPrice) {
     customerId = customerId || null;
     unitPrice = unitPrice || 0;
-    var body = { product_id: productId, quantity: quantity, unit_price: unitPrice, operator: '管理员' };
+    // operator 由后端取登录账号（前端不传，防伪造），流水与账号对应
+    var body = { product_id: productId, quantity: quantity, unit_price: unitPrice };
     if (customerId) body.customer_id = customerId;
     var result = await fetchAPI(API + '/inventory/stock-out', {
         method: 'POST',
@@ -1156,12 +1158,13 @@ async function submitAndDownload() {
 
     // 原子批量出库：后端预检全部商品 → 单事务内逐项扣减，任一失败整体不执行。
     // 修复 H5（原逐项调 stock-out，中途失败会造成部分出库且提示「出库成功」）。
+    // 流水 operator 由后端取登录账号（与账号对应）；上方"经办人"仅用于出库单 Excel 纸质单。
     var items = orderItems.map(function(item) {
         return { product_id: item.product_id, quantity: item.quantity, unit_price: item.sale_price || 0 };
     });
     var r = await fetchAPI(API + '/order/submit', {
         method: 'POST',
-        body: JSON.stringify({ items: items, customer_id: parseInt(cid), operator: operator }),
+        body: JSON.stringify({ items: items, customer_id: parseInt(cid) }),
     });
     if (!r.success) {
         showToast('出库失败，未扣减库存: ' + r.error, 'error');

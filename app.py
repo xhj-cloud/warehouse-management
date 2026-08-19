@@ -17,7 +17,7 @@ import base64
 import hmac
 from flask import (
     Flask, request, jsonify, render_template, send_from_directory, send_file,
-    make_response, session, redirect, url_for,
+    make_response, session, redirect, url_for, has_request_context,
 )
 from functools import wraps
 from flask.json.provider import DefaultJSONProvider
@@ -103,6 +103,19 @@ def _validate_credentials(username, password):
 def _current_username():
     """返回当前已登录用户名；未登录返回 None。"""
     return session.get('username')
+
+
+def _op(default='系统'):
+    """操作者：优先当前登录账号，未登录/无请求上下文时回退 default。
+
+    出入库流水/审计日志的 operator 一律以此为准，不再信任前端传入的 operator，
+    确保「记录操作者 = 登录账号」（防止伪造他人操作）。
+    """
+    if has_request_context():
+        u = session.get('username')
+        if u:
+            return u
+    return default
 
 
 def _is_admin():
@@ -219,13 +232,14 @@ def _read_upload_df(filepath, ext):
     return pd.read_excel(filepath, engine='openpyxl')
 
 
-def _apply_inventory_change(prod_id, new_qty, location='', min_stock=None, max_stock=None, operator='手动调整'):
+def _apply_inventory_change(prod_id, new_qty, location='', min_stock=None, max_stock=None, operator=None):
     """以「出入库流水」的方式把库存调整到目标数量（保留审计），并同步库位/阈值。
 
     必须在 ``with db.transaction():`` 内调用，保证数量变更与流水写入原子化。
     用 SELECT ... FOR UPDATE 锁定目标行，杜绝并发「设为绝对值」时的读-改-写竞态
     （否则两个请求都按旧值算 delta，最后落库值 ≠ 目标值）。
     """
+    operator = operator or _op()   # 操作者 = 登录账号
     # FOR UPDATE 行锁：在事务内锁住该行，后到的并发请求会阻塞到前一个提交，
     # 读到的必然是最新值，从而消除"先读再算 delta"的丢失更新。
     old_inv = db.query_one("SELECT quantity FROM inventory WHERE product_id=%s FOR UPDATE", (prod_id,))
@@ -637,7 +651,7 @@ def api_inbound_recognize():
                         _clean_cell(item.get('specification')))
                 # 入库
                 up = _to_float(item.get('unit_price'))
-                InventoryModel.stock_in(pid, qty, batch_no, 'AI', '入库单识别导入',
+                InventoryModel.stock_in(pid, qty, batch_no, _op('AI'), '入库单识别导入',
                                         unit_price=up, supplier_id=sup_id)
                 imported.append({'name': name, 'sku': sku, 'quantity': qty, 'unit_price': up})
 
@@ -747,7 +761,7 @@ def api_supplier_create():
         with db.transaction():
             sid = SupplierModel.create(d['name'], d.get('contact_person', ''), d.get('phone', ''),
                                         d.get('email', ''), d.get('address', ''), d.get('notes', ''))
-            AuditLog.log('create', 'suppliers', sid, new_data=d, operator='管理员')
+            AuditLog.log('create', 'suppliers', sid, new_data=d, operator=_op())
         return jsonify({'success': True, 'id': sid})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 400
@@ -760,7 +774,7 @@ def api_supplier_update(sid):
             old = SupplierModel.get_by_id(sid)
             SupplierModel.update(sid, d['name'], d.get('contact_person', ''), d.get('phone', ''),
                                  d.get('email', ''), d.get('address', ''), d.get('notes', ''))
-            AuditLog.log('update', 'suppliers', sid, old_data=old, new_data=d, operator='管理员')
+            AuditLog.log('update', 'suppliers', sid, old_data=old, new_data=d, operator=_op())
         return jsonify({'success': True})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 400
@@ -771,7 +785,7 @@ def api_supplier_delete(sid):
         with db.transaction():
             old = SupplierModel.get_by_id(sid)
             SupplierModel.delete(sid)
-            AuditLog.log('delete', 'suppliers', sid, old_data=old, operator='管理员')
+            AuditLog.log('delete', 'suppliers', sid, old_data=old, operator=_op())
         return jsonify({'success': True})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 400
@@ -795,7 +809,7 @@ def api_customer_create():
         with db.transaction():
             cid = CustomerModel.create(d['name'], d.get('contact_person', ''), d.get('phone', ''),
                                         d.get('email', ''), d.get('address', ''), d.get('notes', ''))
-            AuditLog.log('create', 'customers', cid, new_data=d, operator='管理员')
+            AuditLog.log('create', 'customers', cid, new_data=d, operator=_op())
         return jsonify({'success': True, 'id': cid})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 400
@@ -808,7 +822,7 @@ def api_customer_update(cid):
             old = CustomerModel.get_by_id(cid)
             CustomerModel.update(cid, d['name'], d.get('contact_person', ''), d.get('phone', ''),
                                  d.get('email', ''), d.get('address', ''), d.get('notes', ''))
-            AuditLog.log('update', 'customers', cid, old_data=old, new_data=d, operator='管理员')
+            AuditLog.log('update', 'customers', cid, old_data=old, new_data=d, operator=_op())
         return jsonify({'success': True})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 400
@@ -819,7 +833,7 @@ def api_customer_delete(cid):
         with db.transaction():
             old = CustomerModel.get_by_id(cid)
             CustomerModel.delete(cid)
-            AuditLog.log('delete', 'customers', cid, old_data=old, operator='管理员')
+            AuditLog.log('delete', 'customers', cid, old_data=old, operator=_op())
         return jsonify({'success': True})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 400
@@ -894,7 +908,7 @@ def api_product_create():
                  _to_int(data.get('max_stock')) or 9999,
                  prod_id)
             )
-            AuditLog.log('create', 'products', prod_id, new_data=data, operator='管理员')
+            AuditLog.log('create', 'products', prod_id, new_data=data, operator=_op())
         return jsonify({'success': True, 'id': prod_id})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 400
@@ -923,7 +937,7 @@ def api_product_update(prod_id):
                 unit_price=float(data.get('unit_price', 0) or 0),
                 sale_price=float(data.get('sale_price', 0) or 0),
             )
-            AuditLog.log('update', 'products', prod_id, old_data=old, new_data=data, operator='管理员')
+            AuditLog.log('update', 'products', prod_id, old_data=old, new_data=data, operator=_op())
             # 同步更新库存信息（数量变化走出入库流水，保留审计）
             if new_qty is not None:
                 _apply_inventory_change(
@@ -944,7 +958,7 @@ def api_product_delete(prod_id):
         with db.transaction():
             old = ProductModel.get_by_id(prod_id)
             ProductModel.delete(prod_id)
-            AuditLog.log('delete', 'products', prod_id, old_data=old, operator='管理员')
+            AuditLog.log('delete', 'products', prod_id, old_data=old, operator=_op())
         return jsonify({'success': True})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 400
@@ -1011,7 +1025,7 @@ def api_stock_in():
                 product_id=pid,
                 quantity=int(data['quantity']),
                 batch_no=data.get('batch_no', ''),
-                operator=data.get('operator', ''),
+                operator=_op(),
                 notes=data.get('notes', ''),
                 unit_price=up,
                 supplier_id=sid,
@@ -1023,7 +1037,7 @@ def api_stock_in():
                 db.execute("UPDATE products SET supplier_id=%s WHERE id=%s", (sid, pid))
             AuditLog.log('stock_in', 'inventory', pid,
                          new_data={'qty': int(data['quantity']), 'unit_price': up, 'supplier_id': sid},
-                         operator=data.get('operator', ''))
+                         operator=_op())
         return jsonify({'success': True, 'message': '入库成功'})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 400
@@ -1039,14 +1053,14 @@ def api_stock_out():
                 product_id=int(data['product_id']),
                 quantity=int(data['quantity']),
                 batch_no=data.get('batch_no', ''),
-                operator=data.get('operator', ''),
+                operator=_op(),
                 notes=data.get('notes', ''),
                 customer_id=data.get('customer_id'),
                 unit_price=float(data.get('unit_price', 0) or 0),
             )
             AuditLog.log('stock_out', 'inventory', int(data['product_id']),
                          new_data={'qty': int(data['quantity']), 'customer_id': data.get('customer_id')},
-                         operator=data.get('operator', ''))
+                         operator=_op())
         return jsonify({'success': True, 'message': '出库成功'})
     except ValueError as e:
         return jsonify({'success': False, 'error': str(e)}), 400
@@ -1066,7 +1080,7 @@ def api_order_submit():
         data = request.json or {}
         items = data.get('items') or []
         customer_id = data.get('customer_id')
-        operator = _clean_cell(data.get('operator')) or '管理员'
+        operator = _op()   # 操作者 = 登录账号（Excel 经办人由 /api/order/export 单独接收）
         if not isinstance(items, list) or not items:
             return jsonify({'success': False, 'error': '请至少添加一个商品'}), 400
         if not customer_id:
@@ -1386,7 +1400,7 @@ def api_upload():
                                            (product_id, type, quantity, before_qty, after_qty, batch_no, operator, notes)
                                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
                                         (prod_id, txn_type, abs(diff), before_qty, new_qty,
-                                         batch_no, 'Excel导入', f'文件: {original_name}'))
+                                         batch_no, _op('Excel导入'), f'文件: {original_name}'))
 
                         rows_imported += 1
                     except Exception as e:
@@ -1665,7 +1679,7 @@ def api_ai_smart_import():
                     """INSERT INTO transactions
                        (product_id, type, quantity, unit_price, supplier_id, before_qty, after_qty, batch_no, operator, notes)
                        VALUES (%s, 'in', %s, %s, %s, %s, %s, %s, %s, %s)""",
-                    (prod_id, qty, item_price, supplier_id, old_qty, new_qty, batch_no, 'AI', notes))
+                    (prod_id, qty, item_price, supplier_id, old_qty, new_qty, batch_no, _op('AI'), notes))
                 imported.append({'name': name, 'sku': sku, 'quantity': qty})
 
         return jsonify({
@@ -1736,7 +1750,7 @@ def api_ai_chat():
                     if action_type == 'create_order':
                         # AI 创建出库单：先预检全部商品，全部通过才在事务里建客户+扣减，杜绝部分出库与垃圾客户
                         cust_name = (act.get('customer') or '').strip()
-                        op = act.get('operator') or 'AI'
+                        op = _op('AI')
                         keeper = act.get('keeper') or ''
                         wh = act.get('warehouse') or ''
                         order_items = act.get('items') or []
@@ -1933,7 +1947,7 @@ def _do_ai_stock_in(sku, qty, name_hint='', notes='', unit='', category_name='',
         else:
             prod_id = prod['id']
             sup_id = prod.get('supplier_id')  # 已有商品用已有供应商
-        InventoryModel.stock_in(prod_id, qty, _ai_batch_no('AI操作'), 'AI', notes, supplier_id=sup_id)
+        InventoryModel.stock_in(prod_id, qty, _ai_batch_no('AI操作'), _op('AI'), notes, supplier_id=sup_id)
         # 更新供应商
         if sup_id:
             db.execute("UPDATE products SET supplier_id=%s WHERE id=%s", (sup_id, prod_id))
@@ -1945,7 +1959,7 @@ def _do_ai_stock_out(sku, qty, notes=''):
     if not prod:
         raise ValueError(f'商品 {sku} 不存在')
     with db.transaction():
-        InventoryModel.stock_out(prod['id'], qty, _ai_batch_no('AI操作'), 'AI', notes)
+        InventoryModel.stock_out(prod['id'], qty, _ai_batch_no('AI操作'), _op('AI'), notes)
 
 
 def _do_ai_set_quantity(sku, qty, notes=''):
@@ -1963,10 +1977,10 @@ def _do_ai_set_quantity(sku, qty, notes=''):
         note = notes or f'AI调整库存至 {qty}'
         batch_no = _ai_batch_no('AI操作')   # 本次调整独立成批（增/减共用同一批次）
         if delta > 0:
-            InventoryModel.stock_in(prod['id'], delta, batch_no, 'AI', note)
+            InventoryModel.stock_in(prod['id'], delta, batch_no, _op('AI'), note)
         elif delta < 0:
             # 库存不足时 stock_out 抛错，事务回滚，不会出现负库存
-            InventoryModel.stock_out(prod['id'], -delta, batch_no, 'AI', note)
+            InventoryModel.stock_out(prod['id'], -delta, batch_no, _op('AI'), note)
 
 
 # ==========================================
