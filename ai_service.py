@@ -23,6 +23,14 @@ class DecimalEncoder(json.JSONEncoder):
         return super().default(obj)
 
 
+class AIServiceError(RuntimeError):
+    """AI 服务调用失败（连接不上/超时/HTTP 错误）。
+
+    与「解析格式错误」区分开：旧实现把这类故障吞成普通字符串返回，
+    上层 json.loads 失败后误报"解析格式错误"，LM Studio 挂了也查不出来。
+    """
+
+
 class AIService:
     """AI 库存分析服务"""
 
@@ -34,7 +42,7 @@ class AIService:
         self.timeout = LM_STUDIO_CONFIG['timeout']
 
     def _call(self, messages):
-        """调用 LM Studio API"""
+        """调用 LM Studio API。连接失败/超时抛 AIServiceError，不再吞成字符串误导上层。"""
         url = f"{self.base_url}/chat/completions"
         payload = {
             'model': self.model,
@@ -48,11 +56,15 @@ class AIService:
             data = resp.json()
             return data['choices'][0]['message']['content']
         except requests.exceptions.Timeout:
-            return "AI 分析服务超时，请稍后重试。"
+            raise AIServiceError("AI 分析服务超时，请稍后重试。") from None
         except requests.exceptions.ConnectionError:
-            return f"无法连接到 LM Studio 服务，请确认服务是否已启动 ({self.base_url})。"
+            raise AIServiceError(
+                f"无法连接到 LM Studio 服务，请确认服务是否已启动 ({self.base_url})。") from None
+        except requests.exceptions.HTTPError as e:
+            code = e.response.status_code if e.response is not None else '未知'
+            raise AIServiceError(f"LM Studio 返回 HTTP {code} 错误，请检查模型状态。") from None
         except Exception as e:
-            return f"AI 分析出错: {str(e)}"
+            raise AIServiceError(f"AI 分析出错: {str(e)}") from None
 
     def build_inventory_context(self):
         """构建库存上下文数据"""

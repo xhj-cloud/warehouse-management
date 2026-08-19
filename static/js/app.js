@@ -585,7 +585,7 @@ function renderUploadsTable(items) {
         <tr>
             <td>${u.filename}</td>
             <td>${(u.file_size / 1024).toFixed(1)} KB</td>
-            <td><span class="badge badge-${u.status==='success'?'success':u.status==='failed'?'danger':'info'}">${u.status}</span></td>
+            <td><span class="badge badge-${u.status==='success'?'success':u.status==='failed'?'danger':u.status==='partial'?'warning':'info'}">${u.status}</span></td>
             <td>${u.rows_processed}</td>
             <td>${formatDate(u.uploaded_at)}</td>
         </tr>
@@ -635,8 +635,11 @@ async function uploadFile(file) {
         const resp = await fetch(`${API}/upload`, { method: 'POST', body: formData });
         const result = await resp.json();
         if (result.success) {
-            $('#upload-status').textContent = `✅ 导入成功！处理 ${result.data.rows_imported} 条数据`;
-            $('#upload-status').style.color = '#10b981';
+            const partial = result.data.status === 'partial';
+            $('#upload-status').textContent = partial
+                ? `⚠️ 导入完成（部分行失败）：处理 ${result.data.rows_imported} 条数据`
+                : `✅ 导入成功！处理 ${result.data.rows_imported} 条数据`;
+            $('#upload-status').style.color = partial ? '#f59e0b' : '#10b981';
             if (result.data.errors && result.data.errors.length > 0) {
                 showToast(`部分数据导入失败: ${result.data.errors.slice(0, 3).join('; ')}`, 'warning');
             }
@@ -730,6 +733,18 @@ async function runAIAnalysis(type) {
     }
 }
 
+// 渲染 AI 回复：先整体转义 HTML（防 XSS），再把 [文字](/相对路径) 形式的 markdown 链接
+// 转成可点击的 <a>。只放行以 / 开头的站内相对路径，javascript:/http:// 等一律按纯文本显示。
+function renderChatReply(text) {
+    const escaped = String(text == null ? '' : text)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+    return escaped.replace(/\[([^\]]+)\]\((\/[^)\s]+)\)/g,
+        '<a href="$2" target="_blank" rel="noopener">$1</a>');
+}
+
 async function sendAIChat() {
     const input = $('#ai-chat-input');
     const message = input.value.trim();
@@ -754,7 +769,8 @@ async function sendAIChat() {
     });
 
     if (result.success) {
-        aiPlaceholder.textContent = result.data;
+        // 用安全渲染替换纯文本：出库单下载链接 [点击下载出库单](/uploads/...) 可点击
+        aiPlaceholder.innerHTML = renderChatReply(result.data);
     } else {
         aiPlaceholder.textContent = '抱歉，分析出错: ' + result.error;
     }

@@ -9,6 +9,7 @@ Flask API 端点测试：使用 test_client + mock 模型层，不依赖真实�
 import json
 import os
 import re
+import time
 from io import BytesIO
 from types import SimpleNamespace
 
@@ -54,9 +55,13 @@ def patch_all_dbs(app_mod, fake_db, monkeypatch):
     monkeypatch.setattr(app_mod, 'db', fake_db)
 
 
-def make_stateful_inventory(fake_db, monkeypatch, initial_qty=0):
-    """让 FakeDB 模拟真实库存状态：原子增减 SQL 会更新 state，SELECT quantity 回读当前值。"""
-    state = {'qty': initial_qty}
+def make_stateful_inventory(fake_db, monkeypatch, initial_qty=0, location='', min_stock=0, max_stock=9999):
+    """让 FakeDB 模拟真实库存状态：原子增减 SQL 会更新 state，SELECT 回读当前值。
+
+    同时应答两种 SELECT：旧的 `SELECT quantity FROM inventory`（流水回读）和
+    Excel 导入的 `SELECT quantity, location, min_stock, max_stock ...`（保留原库位/阈值）。
+    """
+    state = {'qty': initial_qty, 'location': location, 'min_stock': min_stock, 'max_stock': max_stock}
     orig_execute = fake_db.execute
 
     def smart_execute(sql, params=None):
@@ -71,8 +76,11 @@ def make_stateful_inventory(fake_db, monkeypatch, initial_qty=0):
 
     monkeypatch.setattr(fake_db, 'execute', smart_execute)
     fake_db.one_side_effect = (
-        lambda sql, params=None: {'quantity': state['qty']}
-        if 'SELECT quantity FROM inventory' in sql else None
+        lambda sql, params=None: {
+            'quantity': state['qty'], 'location': state['location'],
+            'min_stock': state['min_stock'], 'max_stock': state['max_stock'],
+        }
+        if ('SELECT quantity FROM inventory' in sql or 'SELECT quantity, location' in sql) else None
     )
     return state
 
@@ -1103,3 +1111,288 @@ class TestExportValidation:
         cd = resp.headers.get('Content-Disposition', '')
         assert '/' not in cd                       # 无路径穿越字符
         assert re.search(r'\d{8}_\d{6}', cd)       # 秒级时间戳
+
+
+# ==========================================
+#  回归：Excel 重导入保留库位/阈值 + 自动库位修复（二 / #10）
+# ==========================================
+class TestExcelImportLocationThresholds:
+    def _patch(self, app_mod, fake_db, monkeypatch, existing=None):
+        monkeypatch.setattr(app_mod.CategoryModel, 'get_all', make_recorder([]))
+        monkeypatch.setattr(app_mod.ProductModel, 'get_by_sku', make_recorder(existing))
+        monkeypatch.setattr(app_mod.ProductModel, 'create', make_recorder(1))
+        monkeypatch.setattr(app_mod.ExcelUploadModel, 'create', make_recorder(7))
+        self.update_status = make_recorder(None)
+        monkeypatch.setattr(app_mod.ExcelUploadModel, 'update_status', self.update_status)
+        patch_all_dbs(app_mod, fake_db, monkeypatch)
+
+    def test_reimport_without_location_cols_preserves_existing(self, app_mod, client, fake_db, monkeypatch):
+        """回归 二：文件没有库位/最低库存/最高库存列 → 重导入不得抹掉已有库位与阈值"""
+        self._patch(app_mod, fake_db, monkeypatch, existing={'id': 9})
+        make_stateful_inventory(fake_db, monkeypatch, initial_qty=80,
+                                location='B-007', min_stock=5, max_stock=100)
+        buf = make_xlsx([['商品名称', 'SKU', '数量'], ['螺丝 M6', 'S1', 30]])
+
+        resp = client.post('/api/upload', data={'file': (buf, 't.xlsx'), 'mode': 'replace'},
+                           content_type='multipart/form-data')
+        assert resp.status_code == 200 and resp.get_json()['success'] is True
+
+        hits = fake_db.find_executed('UPDATE inventory SET location=%s, min_stock=%s, max_stock=%s')
+        assert len(hits) == 1
+        # params: (location, min_stock, max_stock, product_id) → 全部保留原值，不再被冲成 ''/0/9999
+        assert hits[0][1] == ('B-007', 5, 100, 9)
+
+    def test_reimport_with_explicit_thresholds_updates_them(self, app_mod, client, fake_db, monkeypatch):
+        """回归 二：文件显式提供最低/最高库存 → 用新值；库位列缺失仍保留原库位"""
+        self._patch(app_mod, fake_db, monkeypatch, existing={'id': 9})
+        make_stateful_inventory(fake_db, monkeypatch, initial_qty=80,
+                                location='B-007', min_stock=5, max_stock=100)
+        buf = make_xlsx([['商品名称', 'SKU', '数量', '最低库存', '最高库存'],
+                         ['螺丝 M6', 'S1', 30, 2, 50]])
+
+        resp = client.post('/api/upload', data={'file': (buf, 't.xlsx'), 'mode': 'replace'},
+                           content_type='multipart/form-data')
+        assert resp.status_code == 200 and resp.get_json()['success'] is True
+
+        hits = fake_db.find_executed('UPDATE inventory SET location=%s, min_stock=%s, max_stock=%s')
+        assert hits[0][1] == ('B-007', 2, 50, 9)
+
+    def test_uncategorized_auto_location_is_null_and_numeric_max(self, app_mod, client, fake_db, monkeypatch):
+        """回归 #10：未分类商品（category_id=None）自动库位必须用 IS NULL 查询且取数值最大"""
+        self._patch(app_mod, fake_db, monkeypatch)   # 新商品 → prod_id=1，无分类
+        make_stateful_inventory(fake_db, monkeypatch, initial_qty=0)
+
+        # 已有未分类库位含 ZZ-999 / ZZ-1000（字符串排序 max 会错取 'ZZ-999'）
+        fake_db.query_side_effect = (
+            lambda sql, params=None: [{'location': 'ZZ-999'}, {'location': 'ZZ-1000'}]
+            if 'category_id IS NULL' in sql else []
+        )
+        buf = make_xlsx([['商品名称', '数量'], ['神秘物品', 5]])
+
+        resp = client.post('/api/upload', data={'file': (buf, 't.xlsx'), 'mode': 'replace'},
+                           content_type='multipart/form-data')
+        assert resp.status_code == 200 and resp.get_json()['success'] is True
+
+        # 必须发出 IS NULL 查询（旧代码 WHERE p.category_id=%s 传 None 永远查不到 → ZZ-001 反复复用）
+        assert len(fake_db.find_queried('category_id IS NULL')) == 1
+        hits = fake_db.find_executed('UPDATE inventory SET location=%s, min_stock=%s, max_stock=%s')
+        # 数值最大是 1000 → 下一个应为 ZZ-1001（字符串排序会给出与已有库位冲突的 ZZ-1000）
+        assert hits[0][1][0] == 'ZZ-1001'
+
+    def test_categorized_auto_location_numeric_max(self, app_mod, client, fake_db, monkeypatch):
+        """回归 #10：有分类商品自动库位取同前缀库位的数值最大 + 1"""
+        self._patch(app_mod, fake_db, monkeypatch)
+        make_stateful_inventory(fake_db, monkeypatch, initial_qty=0)
+
+        fake_db.query_side_effect = (
+            lambda sql, params=None: [{'location': '电子-999'}, {'location': '电子-1000'}]
+            if 'p.category_id=%s' in sql else []
+        )
+        buf = make_xlsx([['商品名称', '分类', '数量'], ['电阻 1kΩ', '电子产品', 5]])
+
+        resp = client.post('/api/upload', data={'file': (buf, 't.xlsx'), 'mode': 'replace'},
+                           content_type='multipart/form-data')
+        assert resp.status_code == 200 and resp.get_json()['success'] is True
+
+        hits = fake_db.find_executed('UPDATE inventory SET location=%s, min_stock=%s, max_stock=%s')
+        assert hits[0][1][0] == '电子-1001'
+
+
+# ==========================================
+#  回归：上传状态 partial（#11）
+# ==========================================
+class TestUploadPartialStatus:
+    def _patch(self, app_mod, fake_db, monkeypatch):
+        monkeypatch.setattr(app_mod.CategoryModel, 'get_all', make_recorder([]))
+        monkeypatch.setattr(app_mod.ProductModel, 'get_by_sku', make_recorder(None))
+        monkeypatch.setattr(app_mod.ProductModel, 'create', make_recorder(1))
+        monkeypatch.setattr(app_mod.ExcelUploadModel, 'create', make_recorder(7))
+        self.update_status = make_recorder(None)
+        monkeypatch.setattr(app_mod.ExcelUploadModel, 'update_status', self.update_status)
+        patch_all_dbs(app_mod, fake_db, monkeypatch)
+
+    def test_row_errors_mark_partial(self, app_mod, client, fake_db, monkeypatch):
+        """回归 #11：存在行级错误 → 状态 partial，不再一律 success"""
+        self._patch(app_mod, fake_db, monkeypatch)
+        buf = make_xlsx([['商品名称', '数量'], ['螺丝 M6', -5]])
+
+        resp = client.post('/api/upload', data={'file': (buf, 't.xlsx'), 'mode': 'replace'},
+                           content_type='multipart/form-data')
+        assert resp.status_code == 200
+        body = resp.get_json()
+        assert body['data']['status'] == 'partial'
+        final_status = self.update_status.calls[-1]
+        assert final_status['args'][1] == 'partial'
+
+    def test_clean_upload_still_success(self, app_mod, client, fake_db, monkeypatch):
+        """回归 #11：无错误 → 仍为 success"""
+        self._patch(app_mod, fake_db, monkeypatch)
+        buf = make_xlsx([['商品名称', '数量'], ['螺丝 M6', 50]])
+
+        resp = client.post('/api/upload', data={'file': (buf, 't.xlsx'), 'mode': 'replace'},
+                           content_type='multipart/form-data')
+        assert resp.status_code == 200
+        body = resp.get_json()
+        assert body['data']['status'] == 'success'
+        final_status = self.update_status.calls[-1]
+        assert final_status['args'][1] == 'success'
+
+
+# ==========================================
+#  回归：AI 批次号唯一（#13）
+# ==========================================
+class TestAIBatchUnique:
+    BATCH_RE = re.compile(r'^AI(?:识别|导入|操作|出库)-\d{14}-[0-9a-f]{6}$')
+
+    def test_inbound_recognize_unique_batch(self, app_mod, client, fake_db, monkeypatch):
+        """回归 #13：入库识别批次号每次调用唯一（旧常量 'AI视觉识别' 会让多次导入合并成一批）"""
+        items = [{'name': '螺丝 M6', 'sku': 'S1', 'quantity': 5}]
+        monkeypatch.setattr(app_mod.ai_service, 'recognize_inbound_image', lambda b64: items)
+        monkeypatch.setattr(app_mod.ProductModel, 'get_by_sku', make_recorder({'id': 9}))
+        patch_all_dbs(app_mod, fake_db, monkeypatch)
+
+        resp = client.post('/api/ai/inbound-recognize', json={'image': 'aGVsbG8='})
+        assert resp.status_code == 200 and resp.get_json()['success'] is True
+
+        txn = fake_db.find_executed('INSERT INTO transactions')
+        assert len(txn) == 1
+        # stock_in 流水参数: (product_id, qty, unit_price, supplier_id, before, after, batch_no, operator, notes)
+        assert self.BATCH_RE.match(txn[0][1][6])
+
+    def test_smart_import_unique_batch(self, app_mod, client, fake_db, monkeypatch):
+        """回归 #13：智能导入批次号每次调用唯一（旧常量 'AI智能导入'）"""
+        items = [{'name': '螺丝 M6', 'sku': 'S1', 'quantity': 5}]
+        monkeypatch.setattr(app_mod.ai_service, 'smart_import', lambda text: items)
+        existing = {'id': 9}
+        monkeypatch.setattr(app_mod.ProductModel, 'get_by_sku', make_recorder(existing))
+        monkeypatch.setattr(app_mod.CategoryModel, 'get_all', make_recorder([]))
+        monkeypatch.setattr(app_mod.SupplierModel, 'get_all', make_recorder([]))
+        make_stateful_inventory(fake_db, monkeypatch, initial_qty=20)
+        patch_all_dbs(app_mod, fake_db, monkeypatch)
+
+        resp = client.post('/api/ai/smart-import', json={'text': '采购螺丝 5 个'})
+        assert resp.status_code == 200 and resp.get_json()['success'] is True
+
+        txn = fake_db.find_executed('INSERT INTO transactions')
+        assert len(txn) == 1
+        # smart import 流水参数: (product_id, qty, price, supplier_id, before, after, batch_no, operator, notes)
+        assert self.BATCH_RE.match(txn[0][1][6])
+
+    def test_chat_stock_in_unique_batch_per_action(self, app_mod, client, fake_db, monkeypatch):
+        """回归 #13：同一轮对话的多个入库动作不得共用批次（旧常量 'AI操作'）"""
+        reply = ('好的。\n```action\n'
+                 '[{"action": "stock_in", "sku": "S1", "quantity": 5},'
+                 '{"action": "stock_in", "sku": "S2", "quantity": 3}]\n```\n')
+        monkeypatch.setattr(app_mod.ai_service, 'chat', lambda msg: reply)
+        monkeypatch.setattr(app_mod.ProductModel, 'get_by_sku', make_recorder({'id': 9}))
+        patch_all_dbs(app_mod, fake_db, monkeypatch)
+
+        resp = client.post('/api/ai/chat', json={'message': '入库'})
+        assert resp.status_code == 200 and resp.get_json()['success'] is True
+
+        txn = fake_db.find_executed('INSERT INTO transactions')
+        assert len(txn) == 2
+        batches = [p[6] for _, p in txn]
+        assert all(self.BATCH_RE.match(b) for b in batches)
+        assert batches[0] != batches[1]
+
+    def test_create_order_unique_batch_and_writes_file(self, app_mod, client, tmp_path, fake_db, monkeypatch):
+        """回归 #13/#12：AI 出库单每单独立批次（旧常量 'AI出库单'），且文件落盘可下载"""
+        reply = ('好的。\n```action\n' + json.dumps([{
+            'action': 'create_order', 'customer': '中建公司', 'operator': '张三',
+            'items': [{'sku': 'SCR-1', 'quantity': 2, 'price': 0.5}]
+        }], ensure_ascii=False) + '\n```\n')
+        monkeypatch.setattr(app_mod.ai_service, 'chat', lambda msg: reply)
+        monkeypatch.setattr(app_mod.CustomerModel, 'get_by_name', make_recorder({'id': 8}))
+        monkeypatch.setattr(app_mod.ProductModel, 'get_by_sku', make_recorder(
+            {'id': 7, 'name': '螺丝 M6', 'specification': ''}))
+        fake_db.one_side_effect = lambda sql, params=None: {'quantity': 10}
+        patch_all_dbs(app_mod, fake_db, monkeypatch)
+        monkeypatch.setattr(app_mod, 'UPLOAD_FOLDER', str(tmp_path))
+
+        resp = client.post('/api/ai/chat', json={'message': '创建出库单'})
+        body = resp.get_json()
+        assert resp.status_code == 200 and body['success'] is True
+
+        txn = fake_db.find_executed('INSERT INTO transactions')
+        assert len(txn) == 1
+        # stock_out 流水参数: (product_id, qty, unit_price, before, after, batch_no, operator, notes, customer_id)
+        assert self.BATCH_RE.match(txn[0][1][5])
+
+        files = os.listdir(str(tmp_path))
+        assert any(f.startswith('出库单_') and f.endswith('.xlsx') for f in files)
+
+
+# ==========================================
+#  回归：AI 出库单文件清理（#12a）
+# ==========================================
+class TestOrderFileCleanup:
+    def test_cleanup_removes_only_expired_order_files(self, app_mod, tmp_path, monkeypatch):
+        up = tmp_path / 'uploads'
+        up.mkdir()
+        old = up / '出库单_旧客户_20250101_000000.xlsx'
+        old.write_bytes(b'PK')
+        new = up / '出库单_新客户_20990101_000000.xlsx'
+        new.write_bytes(b'PK')
+        other = up / '库存清单_20250101_000000.xlsx'   # 非出库单文件不得被清理
+        other.write_bytes(b'PK')
+
+        old_ts = time.time() - 8 * 86400
+        os.utime(str(old), (old_ts, old_ts))
+
+        monkeypatch.setattr(app_mod, 'UPLOAD_FOLDER', str(up))
+        app_mod._cleanup_old_order_files(keep_days=7)
+
+        assert not old.exists()          # 过期出库单被清理
+        assert new.exists()              # 新文件保留
+        assert other.exists()            # 非出库单文件不动
+
+
+# ==========================================
+#  回归：AI 服务连接错误不再伪装成解析错误（#14）
+# ==========================================
+class TestAIServiceErrors:
+    def test_connection_error_raises_aiserviceerror(self, monkeypatch):
+        import ai_service as ai_mod
+
+        def boom(*a, **k):
+            raise requests_lib.exceptions.ConnectionError('refused')
+        monkeypatch.setattr(ai_mod.requests, 'post', boom)
+
+        with pytest.raises(ai_mod.AIServiceError, match='无法连接'):
+            ai_mod.ai_service._call([{'role': 'user', 'content': 'hi'}])
+
+    def test_timeout_raises_aiserviceerror(self, monkeypatch):
+        import ai_service as ai_mod
+
+        def boom(*a, **k):
+            raise requests_lib.exceptions.Timeout('slow')
+        monkeypatch.setattr(ai_mod.requests, 'post', boom)
+
+        with pytest.raises(ai_mod.AIServiceError, match='超时'):
+            ai_mod.ai_service._call([{'role': 'user', 'content': 'hi'}])
+
+    def test_http_error_raises_with_status(self, monkeypatch):
+        import ai_service as ai_mod
+        resp = SimpleNamespace(status_code=502)
+        err = requests_lib.exceptions.HTTPError('bad gateway')
+        err.response = resp
+
+        def boom(*a, **k):
+            raise err
+        monkeypatch.setattr(ai_mod.requests, 'post', boom)
+
+        with pytest.raises(ai_mod.AIServiceError, match='HTTP 502'):
+            ai_mod.ai_service._call([{'role': 'user', 'content': 'hi'}])
+
+    def test_recognize_inbound_propagates_connection_error(self, monkeypatch):
+        """回归 #14：LM Studio 挂了 → 入库识别报连接失败，而不是误导性的"解析格式错误" """
+        import ai_service as ai_mod
+
+        def boom(*a, **k):
+            raise requests_lib.exceptions.ConnectionError('refused')
+        monkeypatch.setattr(ai_mod.requests, 'post', boom)
+        monkeypatch.setattr(ai_mod.ai_service, 'ocr_image', lambda b64: '入库单 螺丝 M6 x5')
+
+        with pytest.raises(RuntimeError, match='无法连接'):
+            ai_mod.ai_service.recognize_inbound_image('aGVsbG8=')

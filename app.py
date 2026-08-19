@@ -5,6 +5,7 @@
 import os
 import sys
 import json
+import time
 import uuid
 import decimal
 import traceback
@@ -146,6 +147,32 @@ def _unique_sku(base):
         n += 1
         candidate = f'{base}-{n}'
     return candidate
+
+
+def _ai_batch_no(prefix):
+    """生成 AI 操作唯一批次号（前缀-时间戳-随机后缀）。
+
+    旧实现用常量批次号（'AI视觉识别'/'AI智能导入'/'AI操作'），多次导入在
+    批次视图里合并成一坨、无法追溯；现在每次调用独立成批，与 Excel-{upload_id} 对齐。
+    """
+    return f'{prefix}-{datetime.now().strftime("%Y%m%d%H%M%S")}-{uuid.uuid4().hex[:6]}'
+
+
+def _cleanup_old_order_files(keep_days=7):
+    """清理 uploads/ 中过期的出库单 Excel，防止磁盘无限增长（只动 出库单_*.xlsx）。"""
+    try:
+        cutoff = time.time() - keep_days * 86400
+        for fn in os.listdir(UPLOAD_FOLDER):
+            if not (fn.startswith('出库单_') and fn.endswith('.xlsx')):
+                continue
+            fp = os.path.join(UPLOAD_FOLDER, fn)
+            try:
+                if os.path.isfile(fp) and os.path.getmtime(fp) < cutoff:
+                    os.remove(fp)
+            except OSError:
+                pass
+    except OSError:
+        pass
 
 
 # ==========================================
@@ -376,6 +403,8 @@ def api_inbound_recognize():
 
         imported = []
         skipped = []
+        # 本次识别独立成批（旧常量 'AI视觉识别' 会让多次导入在批次视图里合并）
+        batch_no = _ai_batch_no('AI识别')
         with db.transaction():
             for item in items:
                 if not isinstance(item, dict):
@@ -412,7 +441,7 @@ def api_inbound_recognize():
                         _clean_cell(item.get('specification')))
                 # 入库
                 up = _to_float(item.get('unit_price'))
-                InventoryModel.stock_in(pid, qty, 'AI视觉识别', 'AI', '入库单识别导入',
+                InventoryModel.stock_in(pid, qty, batch_no, 'AI', '入库单识别导入',
                                         unit_price=up, supplier_id=sup_id)
                 imported.append({'name': name, 'sku': sku, 'quantity': qty, 'unit_price': up})
 
@@ -991,36 +1020,59 @@ def api_upload():
                             if qty < 0:
                                 errors.append(f"第 {idx+2} 行: 数量为负({qty})，已跳过库存更新")
                             else:
+                                # 查询原库存（用于差异计算、流水记录，以及文件缺列时保留原有库位/阈值）
+                                old_inv = db.query_one(
+                                    "SELECT quantity, location, min_stock, max_stock FROM inventory WHERE product_id = %s",
+                                    (prod_id,)
+                                )
+                                old_qty = old_inv['quantity'] if old_inv else 0
+
+                                # 库位：文件没有库位列时保留原库位，避免重导入把已有库位冲掉
                                 location = _clean_cell(row.get('location'))
-                                # 自动生成库位
+                                if not location and old_inv and _clean_cell(old_inv.get('location')):
+                                    location = old_inv['location']
+
+                                # 自动生成库位（仅当没有可保留的原有库位时）
                                 if not location:
                                     cat_key = cat_name[:2] if cat_name else 'ZZ'
                                     if cat_key not in loc_counters:
-                                        max_loc = db.query_one(
-                                            """SELECT location FROM inventory i
-                                               JOIN products p ON i.product_id=p.id
-                                               WHERE p.category_id=%s AND i.location LIKE %s
-                                               ORDER BY i.location DESC LIMIT 1""",
-                                            (category_id, f'{cat_key}-%')
-                                        )
-                                        if max_loc and max_loc['location']:
-                                            try:
-                                                loc_counters[cat_key] = int(max_loc['location'].split('-')[1]) + 1
-                                            except (ValueError, IndexError):
-                                                loc_counters[cat_key] = 1
+                                        # 未分类商品 category_id=None → 必须用 IS NULL，
+                                        # 否则 WHERE p.category_id=%s 永远查不到、每次上传都从 ZZ-001 重来
+                                        if category_id is None:
+                                            loc_rows = db.query(
+                                                """SELECT i.location FROM inventory i
+                                                   JOIN products p ON i.product_id=p.id
+                                                   WHERE p.category_id IS NULL AND i.location LIKE %s""",
+                                                (f'{cat_key}-%',))
                                         else:
-                                            loc_counters[cat_key] = 1
+                                            loc_rows = db.query(
+                                                """SELECT i.location FROM inventory i
+                                                   JOIN products p ON i.product_id=p.id
+                                                   WHERE p.category_id=%s AND i.location LIKE %s""",
+                                                (category_id, f'{cat_key}-%'))
+                                        # 取数值最大（字符串排序在超过 999 个库位时会把 'ZZ-1000' 排在 'ZZ-999' 前）
+                                        nums = []
+                                        for r in loc_rows:
+                                            try:
+                                                nums.append(int(r['location'].split('-')[1]))
+                                            except (ValueError, IndexError, TypeError):
+                                                continue
+                                        loc_counters[cat_key] = max(nums) + 1 if nums else 1
                                     else:
                                         loc_counters[cat_key] += 1
                                     location = f'{cat_key}-{loc_counters[cat_key]:03d}'
-                                min_stock = _to_int(row.get('min_stock')) or 0
-                                max_stock = _to_int(row.get('max_stock')) or 9999
 
-                                # 查询原库存（仅用于计算差异与流水记录）
-                                old_inv = db.query_one(
-                                    "SELECT quantity FROM inventory WHERE product_id = %s", (prod_id,)
-                                )
-                                old_qty = old_inv['quantity'] if old_inv else 0
+                                # 阈值：文件显式提供才更新，否则保留原值（重导入无阈值列的文件不再抹掉低库存预警）
+                                min_raw = row.get('min_stock')
+                                max_raw = row.get('max_stock')
+                                if min_raw is not None and _clean_cell(min_raw) != '':
+                                    min_stock = _to_int(min_raw) or 0
+                                else:
+                                    min_stock = old_inv['min_stock'] if old_inv else 0
+                                if max_raw is not None and _clean_cell(max_raw) != '':
+                                    max_stock = _to_int(max_raw) or 9999
+                                else:
+                                    max_stock = old_inv['max_stock'] if old_inv else 9999
 
                                 # 增量模式：Excel 数量为新增量，累加到现有库存
                                 diff = qty if mode == 'increment' else qty - old_qty
@@ -1073,12 +1125,15 @@ def api_upload():
                         errors.append(f"第 {idx+2} 行: {str(e)}")
 
             err_summary = f"{len(errors)} 行出错" if errors else ''
-            ExcelUploadModel.update_status(upload_id, 'success', rows_imported, err_summary)
+            # 有行级错误时标记 partial，不再一律 success（上传记录里能看出部分失败）
+            status = 'partial' if errors else 'success'
+            ExcelUploadModel.update_status(upload_id, status, rows_imported, err_summary)
 
             return jsonify({
                 'success': True,
                 'data': {
                     'upload_id': upload_id,
+                    'status': status,
                     'rows_imported': rows_imported,
                     'total_rows': len(df),
                     'errors': errors[:20],  # 最多返回20条错误
@@ -1279,6 +1334,8 @@ def api_ai_smart_import():
 
         # 2. 逐个导入（整体事务，异常回滚，避免半截数据）
         imported = []
+        # 本次导入独立成批（旧常量 'AI智能导入' 会让多次导入在批次视图里合并）
+        batch_no = _ai_batch_no('AI导入')
         with db.transaction():
             for item in items:
                 if not isinstance(item, dict):
@@ -1340,7 +1397,7 @@ def api_ai_smart_import():
                     """INSERT INTO transactions
                        (product_id, type, quantity, unit_price, supplier_id, before_qty, after_qty, batch_no, operator, notes)
                        VALUES (%s, 'in', %s, %s, %s, %s, %s, %s, %s, %s)""",
-                    (prod_id, qty, item_price, supplier_id, old_qty, new_qty, 'AI智能导入', 'AI', notes))
+                    (prod_id, qty, item_price, supplier_id, old_qty, new_qty, batch_no, 'AI', notes))
                 imported.append({'name': name, 'sku': sku, 'quantity': qty})
 
         return jsonify({
@@ -1447,13 +1504,14 @@ def api_ai_chat():
 
                         # 全部通过 → 事务内建客户+扣减（预检失败时不会留下垃圾客户）
                         done = []
+                        order_batch = _ai_batch_no('AI出库')   # 每单独立批次，便于追溯
                         with db.transaction():
                             cid = None
                             if cust_name:
                                 existing_cust = CustomerModel.get_by_name(cust_name)
                                 cid = existing_cust['id'] if existing_cust else CustomerModel.create(cust_name)
                             for prod, sku_i, qty_i, price_i in plan:
-                                InventoryModel.stock_out(prod['id'], qty_i, 'AI出库单', op,
+                                InventoryModel.stock_out(prod['id'], qty_i, order_batch, op,
                                                          customer_id=cid, unit_price=price_i)
                                 done.append({'name': prod['name'], 'sku': sku_i, 'quantity': qty_i,
                                              'sale_price': price_i, 'specification': prod.get('specification', '')})
@@ -1502,6 +1560,7 @@ def api_ai_chat():
                         fname = f"出库单_{safe_cust}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
                         fpath = os.path.join(UPLOAD_FOLDER, fname)
                         wb.save(fpath)
+                        _cleanup_old_order_files()   # 顺手清理过期出库单，防止 uploads/ 无限增长
                         log.append(f"出库单: {cust_name}, {len(done)}项, 合计¥{total}")
                         reply = (reply or '出库单已创建') + f'\n\n📥 [点击下载出库单](/uploads/{fname})'
                         continue
@@ -1606,7 +1665,7 @@ def _do_ai_stock_in(sku, qty, name_hint='', notes='', unit='', category_name='',
         else:
             prod_id = prod['id']
             sup_id = prod.get('supplier_id')  # 已有商品用已有供应商
-        InventoryModel.stock_in(prod_id, qty, 'AI操作', 'AI', notes, supplier_id=sup_id)
+        InventoryModel.stock_in(prod_id, qty, _ai_batch_no('AI操作'), 'AI', notes, supplier_id=sup_id)
         # 更新供应商
         if sup_id:
             db.execute("UPDATE products SET supplier_id=%s WHERE id=%s", (sup_id, prod_id))
@@ -1618,7 +1677,7 @@ def _do_ai_stock_out(sku, qty, notes=''):
     if not prod:
         raise ValueError(f'商品 {sku} 不存在')
     with db.transaction():
-        InventoryModel.stock_out(prod['id'], qty, 'AI操作', 'AI', notes)
+        InventoryModel.stock_out(prod['id'], qty, _ai_batch_no('AI操作'), 'AI', notes)
 
 
 def _do_ai_set_quantity(sku, qty, notes=''):
@@ -1633,11 +1692,12 @@ def _do_ai_set_quantity(sku, qty, notes=''):
         old_qty = old['quantity'] if old else 0
         delta = qty - old_qty
         note = notes or f'AI调整库存至 {qty}'
+        batch_no = _ai_batch_no('AI操作')   # 本次调整独立成批（增/减共用同一批次）
         if delta > 0:
-            InventoryModel.stock_in(prod['id'], delta, 'AI操作', 'AI', note)
+            InventoryModel.stock_in(prod['id'], delta, batch_no, 'AI', note)
         elif delta < 0:
             # 库存不足时 stock_out 抛错，事务回滚，不会出现负库存
-            InventoryModel.stock_out(prod['id'], -delta, 'AI操作', 'AI', note)
+            InventoryModel.stock_out(prod['id'], -delta, batch_no, 'AI', note)
 
 
 # ==========================================

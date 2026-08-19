@@ -86,18 +86,25 @@ class TestCall:
         assert captured['payload']['model'] == ai_mod.LM_STUDIO_CONFIG['model']
         assert captured['payload']['messages'][0]['content'] == 'hi'
 
-    def test_timeout_returns_friendly_message(self, svc, monkeypatch):
+    def test_timeout_raises_aiserviceerror(self, svc, monkeypatch):
+        """回归 #14：超时抛 AIServiceError（旧实现返回字符串，上层误报"解析格式错误"）"""
         def boom(*a, **k):
             raise requests_lib.exceptions.Timeout('timed out')
         monkeypatch.setattr(ai_mod.requests, 'post', boom)
-        assert '超时' in svc._call([{'role': 'user', 'content': 'x'}])
+        with pytest.raises(ai_mod.AIServiceError, match='超时'):
+            svc._call([{'role': 'user', 'content': 'x'}])
 
-    def test_connection_error_returns_friendly_message(self, svc, monkeypatch):
+    def test_connection_error_raises_aiserviceerror(self, svc, monkeypatch):
+        """回归 #14：连接失败抛 AIServiceError，错误信息直达用户而不是被 json 解析吞掉"""
         def boom(*a, **k):
             raise requests_lib.exceptions.ConnectionError('refused')
         monkeypatch.setattr(ai_mod.requests, 'post', boom)
-        msg = svc._call([{'role': 'user', 'content': 'x'}])
-        assert '无法连接' in msg
+        with pytest.raises(ai_mod.AIServiceError, match='无法连接'):
+            svc._call([{'role': 'user', 'content': 'x'}])
+
+    def test_aiserviceerror_is_runtime_error(self):
+        """AIServiceError 必须是 RuntimeError 子类：入库识别端点按 RuntimeError 捕获并返回准确错误"""
+        assert issubclass(ai_mod.AIServiceError, RuntimeError)
 
 
 # ==========================================
