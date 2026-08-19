@@ -83,7 +83,7 @@ CREATE TABLE IF NOT EXISTS excel_uploads (
     filename        VARCHAR(255)    NOT NULL,
     file_size       BIGINT          DEFAULT 0,
     rows_processed  INT             DEFAULT 0,
-    status          ENUM('pending', 'processing', 'success', 'failed') DEFAULT 'pending',
+    status          ENUM('pending', 'processing', 'success', 'failed', 'partial') DEFAULT 'pending',
     error_message   TEXT,
     uploaded_at     TIMESTAMP       DEFAULT CURRENT_TIMESTAMP
 ) ENGINE=InnoDB;
@@ -158,6 +158,16 @@ WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'products' AND COLUMN_NAME = 's
 SET @sql = IF(@col_exists = 0,
     'ALTER TABLE products ADD COLUMN sale_price DECIMAL(12,2) DEFAULT 0 AFTER unit_price',
     'SELECT "sale_price already exists"');
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+-- excel_uploads.status 增加 'partial'（部分行导入失败）
+SET @enum_val = '';
+SELECT COLUMN_TYPE INTO @enum_val
+FROM information_schema.COLUMNS
+WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'excel_uploads' AND COLUMN_NAME = 'status';
+SET @sql = IF(@enum_val NOT LIKE '%partial%',
+    "ALTER TABLE excel_uploads MODIFY COLUMN status ENUM('pending','processing','success','failed','partial') DEFAULT 'pending'",
+    'SELECT "excel_uploads.status already has partial"');
 PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 
 -- --------------------------------------------
