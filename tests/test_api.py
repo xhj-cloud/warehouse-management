@@ -1396,3 +1396,69 @@ class TestAIServiceErrors:
 
         with pytest.raises(RuntimeError, match='无法连接'):
             ai_mod.ai_service.recognize_inbound_image('aGVsbG8=')
+
+
+# ==========================================
+#  批量出库单（H5 原子提交）
+# ==========================================
+class TestOrderSubmitAtomicy:
+    """回归 H5：手工出库单改为单事务批量接口，防「部分出库 + 提示成功」的半截写。"""
+
+    def _setup_pipeline(self, app_mod, client, fake_db, monkeypatch, inventory_qty=100):
+        """把 get_by_id / stock_out / db 都接好，返回可断言的 recorder。"""
+        # 两个商品
+        def fake_get_by_id(pid):
+            return {'id': pid, 'name': f'商品{pid}', 'sku': f'S-{pid}',
+                    'unit': '个', 'specification': 'x', 'sale_price': 2}
+        monkeypatch.setattr(app_mod.ProductModel, 'get_by_id', fake_get_by_id)
+
+        # 库存充足的回读（FakeDB.query_one 的 FOR UPDATE 查询）
+        fake_db.one_side_effect = lambda sql, params=None: (
+            {'quantity': inventory_qty} if 'SELECT quantity FROM inventory' in sql else None)
+
+        # 同时 patch models 与 app 的 db，确保 AuditLog.log 也走 FakeDB（避免连真库）
+        patch_all_dbs(app_mod, fake_db, monkeypatch)
+
+        stock_out_rec = make_recorder(None)   # 记录每次调用的参数
+        monkeypatch.setattr(app_mod.InventoryModel, 'stock_out', stock_out_rec)
+        return stock_out_rec
+
+    def test_success_submits_all_items_in_one_transaction(self, app_mod, client, fake_db, monkeypatch):
+        rec = self._setup_pipeline(app_mod, client, fake_db, monkeypatch, inventory_qty=100)
+        body = {'customer_id': 7, 'operator': '张三',
+                'items': [{'product_id': 3, 'quantity': 5, 'unit_price': 2.0},
+                          {'product_id': 4, 'quantity': 8, 'unit_price': 1.5}]}
+        resp = client.post('/api/order/submit', json=body)
+        assert resp.status_code == 200, resp.get_json()
+        data = resp.get_json()['data']
+        assert data['count'] == 2
+        assert data['batch_no']
+        # 每个商品都走了一次 stock_out
+        assert len([c for c in rec.calls]) == 2
+        # 审计与扣减在同一事务内
+        aud = app_mod.AuditLog
+        # 事务期间所有写都在 in_transaction=True 下发生
+        assert fake_db.in_transaction is False  # 结束后应复位
+
+    def test_oversell_precheck_returns_400_and_does_not_deduct(self, app_mod, client, fake_db, monkeypatch):
+        rec = self._setup_pipeline(app_mod, client, fake_db, monkeypatch, inventory_qty=5)
+        body = {'customer_id': 7, 'operator': '张三',
+                'items': [{'product_id': 3, 'quantity': 5, 'unit_price': 2.0},   # 库存5刚刚够
+                          {'product_id': 4, 'quantity': 100, 'unit_price': 1.5}]}  # 库存不足
+        resp = client.post('/api/order/submit', json=body)
+        assert resp.status_code == 400
+        assert '未执行' in resp.get_json()['error']
+        assert '库存不足' in resp.get_json()['error']
+        # 任何一个商品都不应被扣减（预检失败整体不执行）
+        assert len([c for c in rec.calls]) == 0
+
+    def test_missing_items_rejected(self, app_mod, client, fake_db, monkeypatch):
+        self._setup_pipeline(app_mod, client, fake_db, monkeypatch)
+        resp = client.post('/api/order/submit', json={'customer_id': 7, 'operator': 'x', 'items': []})
+        assert resp.status_code == 400
+
+    def test_missing_customer_rejected(self, app_mod, client, fake_db, monkeypatch):
+        rec = self._setup_pipeline(app_mod, client, fake_db, monkeypatch)
+        resp = client.post('/api/order/submit', json={'operator': 'x',
+                                                      'items': [{'product_id': 3, 'quantity': 1}]})
+        assert resp.status_code == 400

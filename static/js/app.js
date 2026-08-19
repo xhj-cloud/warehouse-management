@@ -11,6 +11,20 @@ let currentPage = 'dashboard';
 function $(sel) { return document.querySelector(sel); }
 function $$(sel) { return document.querySelectorAll(sel); }
 
+// HTML 转义：所有用户可控数据（商品名/客户名/文件名/AI 回复等）经 innerHTML 渲染前必须先过这里，
+// 防止存储型 XSS。注意：内联事件处理器里只允许传数字 id（Number() 强转），字符串一律走内存查找。
+function escapeHtml(v) {
+    return String(v == null ? '' : v)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+// 数字强转：内联 onclick/onblur 里插值的 id/index 必须是纯数字，杜绝属性逃逸
+function num(v) { const n = Number(v); return isNaN(n) ? 0 : n; }
+
 async function fetchAPI(url, options = {}) {
     // 默认 2 分钟超时，避免请求挂起时页面永久卡死；AI 接口可传更长 timeout
     const timeoutMs = options.timeout || 120000;
@@ -158,11 +172,11 @@ function renderLowStockTable(items) {
     }
     tbody.innerHTML = items.map(item => `
         <tr>
-            <td><strong>${item.product_name}</strong></td>
-            <td>${item.sku}</td>
-            <td><span class="badge badge-danger">${item.quantity}</span></td>
-            <td>${item.min_stock}</td>
-            <td>${item.location || '-'}</td>
+            <td><strong>${escapeHtml(item.product_name)}</strong></td>
+            <td>${escapeHtml(item.sku)}</td>
+            <td><span class="badge badge-danger">${num(item.quantity)}</span></td>
+            <td>${num(item.min_stock)}</td>
+            <td>${escapeHtml(item.location || '-')}</td>
         </tr>
     `).join('');
 }
@@ -175,9 +189,9 @@ function renderRecentTransactions(items) {
     }
     tbody.innerHTML = items.map(t => `
         <tr>
-            <td>${t.product_name}</td>
+            <td>${escapeHtml(t.product_name)}</td>
             <td><span class="badge ${t.type === 'in' ? 'badge-success' : 'badge-warning'}">${t.type === 'in' ? '入库' : '出库'}</span></td>
-            <td>${t.quantity}</td>
+            <td>${num(t.quantity)}</td>
             <td>${formatDate(t.created_at)}</td>
         </tr>
     `).join('');
@@ -194,11 +208,11 @@ function renderCategoryChart(stats) {
         <div style="display:flex;align-items:flex-end;gap:20px;height:180px;padding-top:20px;">
             ${stats.map(s => `
                 <div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:6px;">
-                    <span style="font-size:12px;font-weight:600;">${s.total_qty}</span>
-                    <div style="width:100%;max-width:60px;height:${(s.total_qty/maxQty)*140}px;
+                    <span style="font-size:12px;font-weight:600;">${num(s.total_qty)}</span>
+                    <div style="width:100%;max-width:60px;height:${((Number(s.total_qty)||0)/maxQty)*140}px;
                                 background:linear-gradient(180deg, #3b82f6, #2563eb);
                                 border-radius:6px 6px 0 0;min-height:4px;"></div>
-                    <span style="font-size:11px;color:#64748b;text-align:center;">${s.name}</span>
+                    <span style="font-size:11px;color:#64748b;text-align:center;">${escapeHtml(s.name)}</span>
                 </div>
             `).join('')}
         </div>
@@ -229,20 +243,20 @@ function renderProductsTable(products) {
     }
     tbody.innerHTML = products.map(p => `
         <tr>
-            <td><strong>${p.name}</strong></td>
-            <td>${p.sku}</td>
-            <td>${p.category_name || '-'}</td>
-            <td>${p.supplier_name || '-'}</td>
-            <td>${p.unit}</td>
-            <td>${p.specification || '-'}</td>
-            <td>${(p.quantity ?? 0).toLocaleString()}</td>
-            <td>${p.location || '-'}</td>
+            <td><strong>${escapeHtml(p.name)}</strong></td>
+            <td>${escapeHtml(p.sku)}</td>
+            <td>${escapeHtml(p.category_name || '-')}</td>
+            <td>${escapeHtml(p.supplier_name || '-')}</td>
+            <td>${escapeHtml(p.unit)}</td>
+            <td>${escapeHtml(p.specification || '-')}</td>
+            <td>${num(p.quantity).toLocaleString()}</td>
+            <td>${escapeHtml(p.location || '-')}</td>
             <td>
                 <div class="btn-group">
-                    <button class="btn btn-outline btn-sm" onclick="editProduct(${p.id})">编辑</button>
-                    <button class="btn btn-outline btn-sm" onclick="quickStockIn(${p.id},'${p.name}')">入库</button>
-                    <button class="btn btn-outline btn-sm" onclick="quickStockOut(${p.id},'${p.name}')">出库</button>
-                    <button class="btn btn-danger btn-sm" onclick="deleteProduct(${p.id},'${p.name}')">删除</button>
+                    <button class="btn btn-outline btn-sm" onclick="editProduct(${num(p.id)})">编辑</button>
+                    <button class="btn btn-outline btn-sm" onclick="quickStockIn(${num(p.id)})">入库</button>
+                    <button class="btn btn-outline btn-sm" onclick="quickStockOut(${num(p.id)})">出库</button>
+                    <button class="btn btn-danger btn-sm" onclick="deleteProduct(${num(p.id)})">删除</button>
                 </div>
             </td>
         </tr>
@@ -255,7 +269,7 @@ async function loadCategoriesForSelect() {
         const select = $('#product-category');
         if (select) {
             select.innerHTML = '<option value="">请选择分类</option>' +
-                result.data.map(c => `<option value="${c.id}">${c.name}</option>`).join('');
+                result.data.map(c => `<option value="${num(c.id)}">${escapeHtml(c.name)}</option>`).join('');
         }
     }
 }
@@ -330,7 +344,10 @@ async function saveProduct() {
     }
 }
 
-async function deleteProduct(id, name) {
+async function deleteProduct(id) {
+    // 名称从内存数据查找（不再经内联 onclick 字符串传递，防属性逃逸）
+    const p = currentProducts.find(x => x.id === id);
+    const name = (p && p.name) ? p.name : ('商品 ' + id);
     if (!confirm(`确定要删除商品 "${name}" 吗？此操作不可撤销。`)) return;
     const result = await fetchAPI(`${API}/products/${id}`, { method: 'DELETE' });
     if (result.success) {
@@ -346,7 +363,10 @@ function editProduct(id) { showProductModal(id); }
 // ==========================================
 //  快速出入库
 // ==========================================
-async function quickStockIn(productId, name) {
+async function quickStockIn(productId) {
+    // 名称从内存数据查找（不再经内联 onclick 字符串传递，防属性逃逸）
+    var prod = currentProducts.find(function(p) { return p.id === productId; });
+    var name = (prod && prod.name) ? prod.name : ('商品 ' + productId);
     var qty = prompt('请输入 "' + name + '" 入库数量:');
     if (!qty || isNaN(qty) || parseInt(qty) <= 0) return;
     // 选供应商
@@ -363,8 +383,7 @@ async function quickStockIn(productId, name) {
         var cr = await fetchAPI(API + '/suppliers', { method: 'POST', body: JSON.stringify({ name: suppInp.trim() }) });
         if (cr.success) supplierId = cr.id;
     }
-    // 进货价
-    var prod = currentProducts.find(function(p) { return p.id === productId; });
+    // 进货价（复用函数开头查到的 prod）
     var ref = (prod && prod.unit_price > 0) ? '(上次进价: ' + prod.unit_price + ')' : '';
     var priceInp = prompt('请输入 "' + name + '" 进货单价(元): ' + ref);
     if (priceInp === null) return;
@@ -395,10 +414,12 @@ async function doStockIn(productId, quantity, supplierId, unitPrice) {
 
 let _customersCache = null;
 
-async function quickStockOut(productId, name) {
+async function quickStockOut(productId) {
+	    // 名称从内存数据查找（不再经内联 onclick 字符串传递，防属性逃逸）
+	    const prod = currentProducts.find(p => p.id === productId);
+	    const name = (prod && prod.name) ? prod.name : ('商品 ' + productId);
 	    const qty = prompt('请输入 "' + name + '" 出库数量:');
 	    if (!qty || isNaN(qty) || parseInt(qty) <= 0) return;
-	    const prod = currentProducts.find(p => p.id === productId);
 	    const ref = (prod && prod.sale_price > 0) ? '(参考价: ' + prod.sale_price + ')' : '';
 	    const sp = prompt('请输入 "' + name + '" 出库单价(元): ' + ref);
 	    if (sp === null) return;
@@ -442,9 +463,12 @@ async function doStockOut(productId, quantity, customerId, unitPrice) {
 // ==========================================
 //  库存管理
 // ==========================================
+let currentInventory = [];   // 内存缓存：供内联事件处理器按 id 查名称/库位（替代字符串传参）
+
 async function loadInventory() {
     const result = await fetchAPI(`${API}/inventory`);
     if (result.success) {
+        currentInventory = result.data;
         renderInventoryTable(result.data);
     } else {
         showToast('库存加载失败: ' + result.error, 'error');
@@ -461,41 +485,44 @@ function renderInventoryTable(items) {
         const isLow = item.quantity <= item.min_stock;
         return `
             <tr>
-                <td><strong>${item.product_name}</strong></td>
-                <td>${item.sku}</td>
-                <td>${item.category_name || '-'}</td>
-                <td>${item.supplier_name || '-'}</td>
+                <td><strong>${escapeHtml(item.product_name)}</strong></td>
+                <td>${escapeHtml(item.sku)}</td>
+                <td>${escapeHtml(item.category_name || '-')}</td>
+                <td>${escapeHtml(item.supplier_name || '-')}</td>
                 <td style="font-weight:700;color:${isLow ? 'var(--danger)' : 'var(--text)'};">
-                    ${item.quantity.toLocaleString()}
+                    ${num(item.quantity).toLocaleString()}
                 </td>
-                <td>${item.min_stock}</td>
-                <td>${item.max_stock}</td>
-                <td>${item.location || '-'}</td>
+                <td>${num(item.min_stock)}</td>
+                <td>${num(item.max_stock)}</td>
+                <td>${escapeHtml(item.location || '-')}</td>
                 <td>${(item.latest_price && item.latest_price > 0) ? '¥'+parseFloat(item.latest_price).toFixed(2) : '-'}</td>
                 <td>${(item.avg_price && item.avg_price > 0) ? '¥'+parseFloat(item.avg_price).toFixed(2) : '-'}</td>
                 <td>
-                    <button class="btn btn-outline btn-sm" onclick="showBatchDetail(${item.product_id},'${item.product_name}')">批次</button>
-                    <button class="btn btn-outline btn-sm" onclick="editInventory(${item.product_id},${item.quantity},'${item.location||''}',${item.min_stock},${item.max_stock})">调整</button>
+                    <button class="btn btn-outline btn-sm" onclick="showBatchDetail(${num(item.product_id)})">批次</button>
+                    <button class="btn btn-outline btn-sm" onclick="editInventory(${num(item.product_id)})">调整</button>
                 </td>
             </tr>
         `;
     }).join('');
 }
 
-async function showBatchDetail(pid, pname) {
+async function showBatchDetail(pid) {
+    // 名称从内存数据查找（不再经内联 onclick 字符串传递，防属性逃逸）
+    var inv = (currentInventory || []).find(function(x) { return x.product_id === pid; });
+    var pname = (inv && inv.product_name) ? inv.product_name : ('商品 ' + pid);
     var r = await fetchAPI(API + '/transactions?limit=500');
     if (!r.success) return;
     var batches = r.data.filter(function(t) { return t.product_id === pid && t.type === 'in'; });
-    var html = '<h3>' + pname + ' - 进货批次</h3><table style=\"width:100%;font-size:13px;\"><tr><th>时间</th><th>数量</th><th>进价</th><th>金额</th><th>供应商</th></tr>';
+    var html = '<h3>' + escapeHtml(pname) + ' - 进货批次</h3><table style=\"width:100%;font-size:13px;\"><tr><th>时间</th><th>数量</th><th>进价</th><th>金额</th><th>供应商</th></tr>';
     if (batches.length === 0) html += '<tr><td colspan=\"5\" style=\"text-align:center;\">暂无进货记录</td></tr>';
     else batches.forEach(function(b) {
-        html += '<tr><td>' + formatDate(b.created_at) + '</td><td>+' + b.quantity + '</td><td>' + (b.unit_price > 0 ? '¥' + b.unit_price : '-') + '</td><td>' + (b.unit_price > 0 ? '¥' + (b.quantity * b.unit_price).toLocaleString() : '-') + '</td><td>' + (b.supplier_name || '-') + '</td></tr>';
+        html += '<tr><td>' + formatDate(b.created_at) + '</td><td>+' + (Number(b.quantity)||0) + '</td><td>' + ((b.unit_price > 0) ? '¥' + Number(b.unit_price).toLocaleString() : '-') + '</td><td>' + ((b.unit_price > 0) ? '¥' + (Number(b.quantity)*Number(b.unit_price)).toLocaleString() : '-') + '</td><td>' + escapeHtml(b.supplier_name || '-') + '</td></tr>';
     });
     html += '</table>';
     var modal = document.createElement('div');
     modal.className = 'modal-overlay active';
     modal.onclick = function(e) { if (e.target === modal) modal.remove(); };
-    modal.innerHTML = '<div class="modal" style="max-width:700px;"><div class="modal-header"><h3>' + pname + ' - 进货批次</h3><button class="modal-close" id="batch-close-btn">✕</button></div><div class="modal-body">' + html + '</div></div>';
+    modal.innerHTML = '<div class="modal" style="max-width:700px;"><div class="modal-header"><h3>' + escapeHtml(pname) + ' - 进货批次</h3><button class="modal-close" id="batch-close-btn">✕</button></div><div class="modal-body">' + html + '</div></div>';
     setTimeout(function() {
         var btn = document.getElementById('batch-close-btn');
         if (btn) btn.onclick = function() { modal.remove(); };
@@ -503,7 +530,13 @@ async function showBatchDetail(pid, pname) {
     document.body.appendChild(modal);
 }
 
-function editInventory(productId, qty, loc, minS, maxS) {
+function editInventory(productId) {
+    // 原值从内存数据查找（不再经内联 onclick 字符串传递，防属性逃逸）
+    const inv = (currentInventory || []).find(x => x.product_id === productId);
+    const qty = inv ? inv.quantity : 0;
+    const loc = inv ? (inv.location || '') : '';
+    const minS = inv ? inv.min_stock : 0;
+    const maxS = inv ? inv.max_stock : 9999;
     const newQty = prompt('新库存数量:', qty);
     if (newQty === null || isNaN(parseInt(newQty))) return;
     const newLoc = prompt('库位:', loc);
@@ -550,15 +583,15 @@ function renderTransactionsTable(items) {
         var totalStr = (t.unit_price && t.unit_price > 0) ? '¥' + (t.quantity * t.unit_price).toLocaleString() : '-';
         txHtml += '<tr>' +
             '<td>' + formatDate(t.created_at) + '</td>' +
-            '<td>' + t.product_name + '</td>' +
+            '<td>' + escapeHtml(t.product_name) + '</td>' +
             '<td><span class="badge ' + (t.type === 'in' ? 'badge-success' : 'badge-warning') + '">' + (t.type === 'in' ? '入库' : '出库') + '</span></td>' +
-            '<td>' + t.quantity + '</td>' +
-            '<td>' + t.before_qty + ' → ' + t.after_qty + '</td>' +
+            '<td>' + num(t.quantity) + '</td>' +
+            '<td>' + num(t.before_qty) + ' → ' + num(t.after_qty) + '</td>' +
             '<td>' + priceStr + '</td>' +
             '<td>' + totalStr + '</td>' +
-            '<td>' + (t.customer_name || '-') + '</td>' +
-            '<td>' + (t.operator || '-') + '</td>' +
-            '<td>' + (t.notes || '-') + '</td></tr>';
+            '<td>' + escapeHtml(t.customer_name || '-') + '</td>' +
+            '<td>' + escapeHtml(t.operator || '-') + '</td>' +
+            '<td>' + escapeHtml(t.notes || '-') + '</td></tr>';
     }
     tbody.innerHTML = txHtml || '<tr><td colspan="10" style="text-align:center;color:#94a3b8;padding:30px;">暂无交易记录</td></tr>';
 }
@@ -583,10 +616,10 @@ function renderUploadsTable(items) {
     }
     tbody.innerHTML = items.map(u => `
         <tr>
-            <td>${u.filename}</td>
-            <td>${(u.file_size / 1024).toFixed(1)} KB</td>
-            <td><span class="badge badge-${u.status==='success'?'success':u.status==='failed'?'danger':u.status==='partial'?'warning':'info'}">${u.status}</span></td>
-            <td>${u.rows_processed}</td>
+            <td>${escapeHtml(u.filename)}</td>
+            <td>${(Number(u.file_size) / 1024).toFixed(1)} KB</td>
+            <td><span class="badge badge-${u.status==='success'?'success':u.status==='failed'?'danger':u.status==='partial'?'warning':'info'}">${escapeHtml(u.status)}</span></td>
+            <td>${num(u.rows_processed)}</td>
             <td>${formatDate(u.uploaded_at)}</td>
         </tr>
     `).join('');
@@ -683,7 +716,8 @@ async function smartImport() {
     input.disabled = false;
     if (result.success) {
         const d = result.data;
-        status.innerHTML = `✅ 成功导入 ${d.count} 条：${d.imported.map(i => `${i.name} +${i.quantity}`).join('，')}`;
+        // AI 解析出的商品名属于用户可控数据，必须转义后再入 HTML
+        status.innerHTML = `✅ 成功导入 ${num(d.count)} 条：${d.imported.map(i => `${escapeHtml(i.name)} +${num(i.quantity)}`).join('，')}`;
         status.style.color = '#10b981';
         input.value = '';
         // 刷新其他数据
@@ -727,9 +761,10 @@ async function runAIAnalysis(type) {
 
     const result = await fetchAPI(`${API}/ai/analyze?type=${type}`);
     if (result.success) {
-        container.innerHTML = `<div style="white-space:pre-wrap;line-height:1.8;font-size:14px;">${result.data}</div>`;
+        // 与聊天页一致：先整体转义再渲染（防 AI 回显被污染的商品名造成存储型 XSS）
+        container.innerHTML = `<div style="white-space:pre-wrap;line-height:1.8;font-size:14px;">${renderChatReply(result.data)}</div>`;
     } else {
-        container.innerHTML = `<div style="color:var(--danger);">分析失败: ${result.error}</div>`;
+        container.innerHTML = `<div style="color:var(--danger);">分析失败: ${escapeHtml(result.error)}</div>`;
     }
 }
 
@@ -751,8 +786,11 @@ async function sendAIChat() {
     if (!message) return;
 
     const messagesContainer = $('#ai-chat-messages');
-    // 添加用户消息
-    messagesContainer.innerHTML += `<div class="ai-chat-msg user">${message}</div>`;
+    // 添加用户消息（用 textContent，避免自 XSS）
+    const userMsgEl = document.createElement('div');
+    userMsgEl.className = 'ai-chat-msg user';
+    userMsgEl.textContent = message;
+    messagesContainer.appendChild(userMsgEl);
     input.value = '';
     messagesContainer.scrollTop = messagesContainer.scrollHeight;
 
@@ -829,9 +867,9 @@ async function loadCategories() {
         var t = $('#categories-tbody');
         t.innerHTML = r.data.map(function(c) {
             return '<tr>' +
-                '<td contenteditable="true" onblur="updateCategoryField(' + c.id + ',\'name\',this.textContent)" style="font-weight:600;">' + c.name + '</td>' +
-                '<td contenteditable="true" onblur="updateCategoryField(' + c.id + ',\'description\',this.textContent)">' + (c.description || '-') + '</td>' +
-                '<td><button class="btn btn-danger btn-sm" onclick="deleteCategory(' + c.id + ')">删除</button></td>' +
+                '<td contenteditable="true" onblur="updateCategoryField(' + num(c.id) + ',\'name\',this.textContent)" style="font-weight:600;">' + escapeHtml(c.name) + '</td>' +
+                '<td contenteditable="true" onblur="updateCategoryField(' + num(c.id) + ',\'description\',this.textContent)">' + escapeHtml(c.description || '-') + '</td>' +
+                '<td><button class="btn btn-danger btn-sm" onclick="deleteCategory(' + num(c.id) + ')">删除</button></td>' +
                 '</tr>';
         }).join('') || '<tr><td colspan="3" style="text-align:center;padding:30px;">暂无分类</td></tr>';
     }
@@ -875,10 +913,10 @@ async function loadSuppliers() {
         const t = $('#suppliers-tbody');
         t.innerHTML = r.data.map(s => `
             <tr>
-                <td contenteditable="true" onblur="updateSupplierField(${s.id},'name',this.textContent)" style="font-weight:600;">${s.name}</td>
-                <td contenteditable="true" onblur="updateSupplierField(${s.id},'contact_person',this.textContent)">${s.contact_person || '-'}</td>
-                <td contenteditable="true" onblur="updateSupplierField(${s.id},'phone',this.textContent)">${s.phone || '-'}</td>
-                <td><button class="btn btn-danger btn-sm" onclick="deleteSupplier(${s.id})">删除</button></td>
+                <td contenteditable="true" onblur="updateSupplierField(${num(s.id)},'name',this.textContent)" style="font-weight:600;">${escapeHtml(s.name)}</td>
+                <td contenteditable="true" onblur="updateSupplierField(${num(s.id)},'contact_person',this.textContent)">${escapeHtml(s.contact_person || '-')}</td>
+                <td contenteditable="true" onblur="updateSupplierField(${num(s.id)},'phone',this.textContent)">${escapeHtml(s.phone || '-')}</td>
+                <td><button class="btn btn-danger btn-sm" onclick="deleteSupplier(${num(s.id)})">删除</button></td>
             </tr>
         `).join('') || '<tr><td colspan="4" style="text-align:center;padding:30px;">暂无供应商，在上方输入框添加</td></tr>';
     }
@@ -902,7 +940,7 @@ async function loadSuppliersForSelect() {
     const r = await fetchAPI(`${API}/suppliers`);
     if (r.success) {
         const sel = $('#product-supplier');
-        if (sel) sel.innerHTML = '<option value="">请选择供应商</option>' + r.data.map(s => `<option value="${s.id}">${s.name}</option>`).join('');
+        if (sel) sel.innerHTML = '<option value="">请选择供应商</option>' + r.data.map(s => `<option value="${num(s.id)}">${escapeHtml(s.name)}</option>`).join('');
     }
 }
 
@@ -927,10 +965,10 @@ async function loadCustomers() {
         const t = $('#customers-tbody');
         t.innerHTML = r.data.map(c => `
             <tr>
-                <td contenteditable="true" onblur="updateCustomerField(${c.id},'name',this.textContent)" style="font-weight:600;">${c.name}</td>
-                <td contenteditable="true" onblur="updateCustomerField(${c.id},'contact_person',this.textContent)">${c.contact_person || '-'}</td>
-                <td contenteditable="true" onblur="updateCustomerField(${c.id},'phone',this.textContent)">${c.phone || '-'}</td>
-                <td><button class="btn btn-danger btn-sm" onclick="deleteCustomer(${c.id})">删除</button></td>
+                <td contenteditable="true" onblur="updateCustomerField(${num(c.id)},'name',this.textContent)" style="font-weight:600;">${escapeHtml(c.name)}</td>
+                <td contenteditable="true" onblur="updateCustomerField(${num(c.id)},'contact_person',this.textContent)">${escapeHtml(c.contact_person || '-')}</td>
+                <td contenteditable="true" onblur="updateCustomerField(${num(c.id)},'phone',this.textContent)">${escapeHtml(c.phone || '-')}</td>
+                <td><button class="btn btn-danger btn-sm" onclick="deleteCustomer(${num(c.id)})">删除</button></td>
             </tr>
         `).join('') || '<tr><td colspan="4" style="text-align:center;padding:30px;">暂无客户，在上方输入框添加</td></tr>';
     }
@@ -976,7 +1014,7 @@ function searchCustomer() {
     if (list.length === 0) { dd.style.display = 'none'; return; }
     dd.style.display = 'block';
     dd.innerHTML = list.map(function(c, i) {
-        return '<div style="padding:6px 10px;cursor:pointer;" data-idx="' + i + '">' + c.name + '</div>';
+        return '<div style="padding:6px 10px;cursor:pointer;" data-idx="' + num(i) + '">' + escapeHtml(c.name) + '</div>';
     }).join('');
 }
 
@@ -988,8 +1026,8 @@ function searchProduct() {
     if (list.length === 0) { dd.style.display = 'none'; return; }
     dd.style.display = 'block';
     dd.innerHTML = list.map(function(p, i) {
-        var price = p.sale_price > 0 ? ' ¥' + p.sale_price : '';
-        return '<div style="padding:6px 10px;cursor:pointer;" data-idx="' + i + '">' + p.name + ' <span style="color:#94a3b8;">' + p.sku + '</span>' + price + '</div>';
+        var price = (p.sale_price > 0) ? ' ¥' + Number(p.sale_price).toLocaleString() : '';
+        return '<div style="padding:6px 10px;cursor:pointer;" data-idx="' + num(i) + '">' + escapeHtml(p.name) + ' <span style="color:#94a3b8;">' + escapeHtml(p.sku) + '</span>' + price + '</div>';
     }).join('');
 }
 
@@ -1072,14 +1110,14 @@ function renderOrderItems() {
         tbody.innerHTML = '<tr><td colspan=\"6\" style=\"text-align:center;padding:30px;\">请先添加商品</td></tr>';
     } else {
         tbody.innerHTML = orderItems.map(function(item, i) {
-            var sub = item.sale_price * item.quantity;
+            var sub = Number(item.sale_price || 0) * Number(item.quantity || 0);
             total += sub;
-            return '<tr><td><strong>' + item.name + '</strong><br><small>' + item.specification + '</small></td>' +
-                '<td>' + item.sku + '</td>' +
-                '<td><input type=\"number\" value=\"' + item.quantity + '\" min=\"1\" onchange=\"updateOrderQty(' + i + ',this.value)\" style=\"width:60px;\"></td>' +
-                '<td><input type=\"number\" value=\"' + item.sale_price + '\" step=\"0.01\" min=\"0\" onchange=\"updateOrderPrice(' + i + ',this.value)\" style=\"width:80px;\"></td>' +
-                '<td>' + (item.sale_price > 0 ? '¥' + sub.toLocaleString() : '-') + '</td>' +
-                '<td><button class=\"btn btn-danger btn-sm\" onclick=\"removeOrderItem(' + i + ')\">✕</button></td></tr>';
+            return '<tr><td><strong>' + escapeHtml(item.name) + '</strong><br><small>' + escapeHtml(item.specification) + '</small></td>' +
+                '<td>' + escapeHtml(item.sku) + '</td>' +
+                '<td><input type=\"number\" value=\"' + num(item.quantity) + '\" min=\"1\" onchange=\"updateOrderQty(' + num(i) + ',this.value)\" style=\"width:60px;\"></td>' +
+                '<td><input type=\"number\" value=\"' + num(item.sale_price) + '\" step=\"0.01\" min=\"0\" onchange=\"updateOrderPrice(' + num(i) + ',this.value)\" style=\"width:80px;\"></td>' +
+                '<td>' + (sub > 0 ? '¥' + sub.toLocaleString() : '-') + '</td>' +
+                '<td><button class=\"btn btn-danger btn-sm\" onclick=\"removeOrderItem(' + num(i) + ')\">✕</button></td></tr>';
         }).join('');
     }
     document.getElementById('order-total').textContent = '合计: ¥' + total.toLocaleString();
@@ -1106,19 +1144,23 @@ async function submitAndDownload() {
     if (!operator) { showToast('请填写经办人', 'warning'); return; }
     if (orderItems.length === 0) { showToast('请添加商品', 'warning'); return; }
 
-    // 提交出库
-    var ok = true;
-    for (var i = 0; i < orderItems.length; i++) {
-        var item = orderItems[i];
-        var body = { product_id: item.product_id, quantity: item.quantity, customer_id: parseInt(cid), operator: operator, unit_price: item.sale_price };
-        var r = await fetchAPI(API + '/inventory/stock-out', { method: 'POST', body: JSON.stringify(body) });
-        if (!r.success) { showToast(item.name + ' 出库失败: ' + r.error, 'error'); ok = false; }
+    // 原子批量出库：后端预检全部商品 → 单事务内逐项扣减，任一失败整体不执行。
+    // 修复 H5（原逐项调 stock-out，中途失败会造成部分出库且提示「出库成功」）。
+    var items = orderItems.map(function(item) {
+        return { product_id: item.product_id, quantity: item.quantity, unit_price: item.sale_price || 0 };
+    });
+    var r = await fetchAPI(API + '/order/submit', {
+        method: 'POST',
+        body: JSON.stringify({ items: items, customer_id: parseInt(cid), operator: operator }),
+    });
+    if (!r.success) {
+        showToast('出库失败，未扣减库存: ' + r.error, 'error');
+        return;
     }
-    if (!ok) return;
     showToast('出库成功', 'success');
     loadProducts(); loadInventory(); loadTransactions();
 
-    // 生成下载文件
+    // 生成下载文件（出库已原子完成）
     downloadOrder();
     // 清空
     resetOrder();
@@ -1211,7 +1253,7 @@ async function recognizeInboundOrder() {
             div.style.display = 'block';
             var html = '<div class="card"><h4>📋 识别结果</h4><table style="font-size:13px;"><tr><th>商品</th><th>SKU</th><th>数量</th><th>单价</th></tr>';
             r.data.imported.forEach(function(i) {
-                html += '<tr><td>' + i.name + '</td><td>' + i.sku + '</td><td>+' + i.quantity + '</td><td>' + (i.unit_price > 0 ? '¥' + i.unit_price : '-') + '</td></tr>';
+                html += '<tr><td>' + escapeHtml(i.name) + '</td><td>' + escapeHtml(i.sku) + '</td><td>+' + num(i.quantity) + '</td><td>' + ((i.unit_price > 0) ? '¥' + num(i.unit_price) : '-') + '</td></tr>';
             });
             html += '</table></div>';
             div.innerHTML = html;
@@ -1285,12 +1327,12 @@ async function loadAuditLog(table) {
             if (newStr.length > 80) newStr = newStr.substring(0, 80);
             html += '<tr>' +
                 '<td>' + formatDate(l.created_at) + '</td>' +
-                '<td><span class="badge ' + badge + '">' + (labels[l.action] || l.action) + '</span></td>' +
-                '<td>' + l.table_name + '</td>' +
-                '<td>' + (l.record_id || '-') + '</td>' +
-                '<td>' + oldStr + '</td>' +
-                '<td>' + newStr + '</td>' +
-                '<td>' + (l.operator || '-') + '</td>' +
+                '<td><span class="badge ' + badge + '">' + escapeHtml(labels[l.action] || l.action) + '</span></td>' +
+                '<td>' + escapeHtml(l.table_name) + '</td>' +
+                '<td>' + escapeHtml(l.record_id || '-') + '</td>' +
+                '<td>' + escapeHtml(oldStr) + '</td>' +
+                '<td>' + escapeHtml(newStr) + '</td>' +
+                '<td>' + escapeHtml(l.operator || '-') + '</td>' +
                 '</tr>';
         }
         t.innerHTML = html || '<tr><td colspan="7" style="text-align:center;padding:30px;">暂无日志</td></tr>';

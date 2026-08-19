@@ -13,7 +13,10 @@ import logging
 import pymysql
 import pandas as pd
 from datetime import datetime, date
-from flask import Flask, request, jsonify, render_template, send_from_directory, send_file
+import base64
+import hmac
+from flask import Flask, request, jsonify, render_template, send_from_directory, send_file, make_response
+from functools import wraps
 from flask.json.provider import DefaultJSONProvider
 
 # 错误日志文件
@@ -26,7 +29,10 @@ logging.basicConfig(
 _logger = logging.getLogger(__name__)
 from werkzeug.utils import secure_filename
 
-from config import UPLOAD_FOLDER, ALLOWED_EXTENSIONS, SECRET_KEY, MAX_CONTENT_LENGTH
+from config import (
+    UPLOAD_FOLDER, ALLOWED_EXTENSIONS, SECRET_KEY, MAX_CONTENT_LENGTH,
+    AUTH_USER, AUTH_PASSWORD, AUTH_DISABLED,
+)
 from models import (
     db, CategoryModel, ProductModel, InventoryModel,
     TransactionModel, ExcelUploadModel, StatsModel,
@@ -54,6 +60,46 @@ app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH
 
 # 确保上传目录存在
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+
+# ==========================================
+#  HTTP Basic 认证（保护一切写接口与敏感下载）
+# ==========================================
+_AUTH_ENABLED = bool(AUTH_PASSWORD) and not AUTH_DISABLED
+
+if _AUTH_ENABLED:
+    print(f"  认证已启用：/api/* 与 /uploads/* 需 Basic Auth（用户: {AUTH_USER}）")
+else:
+    if AUTH_DISABLED:
+        print("  警告：已通过 DISABLE_AUTH 显式关闭认证（仅限本地联调，请勿用于线上/内网）")
+    else:
+        print("  警告：未设置 AUTH_PASSWORD，认证当前 DISABLED（仅限本地联调，请勿用于线上/内网）")
+
+
+def _basic_auth_required():
+    """校验 Authorization: Basic ...；非文件上传请求失败时返回 401（带 WWW-Authenticate 触发浏览器弹窗）。"""
+    auth = request.authorization
+    if auth and auth.username is not None:
+        # 用 hmac.compare_digest 做常量时间比较，防时序侧信道
+        user_ok = hmac.compare_digest(str(auth.username), str(AUTH_USER))
+        pass_ok = hmac.compare_digest(str(auth.password or ''), str(AUTH_PASSWORD))
+        if user_ok and pass_ok:
+            return True
+    return False
+
+
+@app.before_request
+def _authenticate():
+    """对所有 /api/* 与 /uploads/* 请求强制 Basic Auth（首页与静态资源除外）。"""
+    path = request.path
+    if not (_AUTH_ENABLED and (path.startswith('/api/') or path.startswith('/uploads/'))):
+        return None
+    if _basic_auth_required():
+        return None
+    resp = make_response(
+        jsonify({'success': False, 'error': '需要认证'}), 401)
+    resp.headers['WWW-Authenticate'] = 'Basic realm="warehouse-management"'
+    return resp
 
 
 def allowed_file(filename):
@@ -112,8 +158,12 @@ def _apply_inventory_change(prod_id, new_qty, location='', min_stock=None, max_s
     """以「出入库流水」的方式把库存调整到目标数量（保留审计），并同步库位/阈值。
 
     必须在 ``with db.transaction():`` 内调用，保证数量变更与流水写入原子化。
+    用 SELECT ... FOR UPDATE 锁定目标行，杜绝并发「设为绝对值」时的读-改-写竞态
+    （否则两个请求都按旧值算 delta，最后落库值 ≠ 目标值）。
     """
-    old_inv = db.query_one("SELECT quantity FROM inventory WHERE product_id=%s", (prod_id,))
+    # FOR UPDATE 行锁：在事务内锁住该行，后到的并发请求会阻塞到前一个提交，
+    # 读到的必然是最新值，从而消除"先读再算 delta"的丢失更新。
+    old_inv = db.query_one("SELECT quantity FROM inventory WHERE product_id=%s FOR UPDATE", (prod_id,))
     old_qty = old_inv['quantity'] if old_inv else 0
     delta = new_qty - old_qty
     if delta > 0:
@@ -858,6 +908,76 @@ def api_stock_out():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+@app.route('/api/order/submit', methods=['POST'])
+def api_order_submit():
+    """批量出库单（原子）：预检全部商品 → 单事务内逐项扣减 → 生成 Excel。
+
+    修复 H5：原手工出库单前端逐项调 stock-out，第 2 项失败时第 1 项已扣减且无法回滚，
+    造成「部分出库 + 提示出库成功」的半截写。本接口与 AI create_order 同语义：
+    任一商品不存在/库存不足时整体不执行，不留半截数据。
+    """
+    try:
+        data = request.json or {}
+        items = data.get('items') or []
+        customer_id = data.get('customer_id')
+        operator = _clean_cell(data.get('operator')) or '管理员'
+        if not isinstance(items, list) or not items:
+            return jsonify({'success': False, 'error': '请至少添加一个商品'}), 400
+        if not customer_id:
+            return jsonify({'success': False, 'error': '请选择客户'}), 400
+
+        # 第一遍预检：校验商品存在与库存充足，不产生任何写入
+        plan = []
+        problems = []
+        order_batch = _ai_batch_no('出库单')   # 每单独立批次，便于追溯
+        for it in items:
+            pid = _to_int(it.get('product_id'))
+            qty = _to_int(it.get('quantity'))
+            price = _to_float(it.get('unit_price'))
+            prod = ProductModel.get_by_id(pid) if pid else None
+            if not prod:
+                problems.append(f"商品不存在: {pid}")
+                continue
+            if qty is None or qty <= 0:
+                problems.append(f"数量无效: {prod['name']}")
+                continue
+            inv = db.query_one(
+                "SELECT quantity FROM inventory WHERE product_id=%s FOR UPDATE", (pid,))
+            avail = inv['quantity'] if inv else 0
+            if avail < qty:
+                problems.append(f"库存不足: {prod['name']} 当前{avail} 需{qty}")
+                continue
+            plan.append({'prod': prod, 'qty': qty, 'price': price or 0})
+
+        if problems:
+            return jsonify({'success': False, 'error': '出库单未执行：' + '；'.join(problems)}), 400
+
+        # 全部通过 → 单事务内逐项原子扣减（FOR UPDATE 已锁行，杜绝并发超卖），失败整体回滚
+        done = []
+        with db.transaction():
+            for p in plan:
+                InventoryModel.stock_out(p['prod']['id'], p['qty'], order_batch, operator,
+                                         customer_id=int(customer_id), unit_price=p['price'])
+                done.append({'product_id': p['prod']['id'], 'name': p['prod']['name'],
+                             'sku': p['prod']['sku'], 'quantity': p['qty'],
+                             'unit': p['prod'].get('unit', ''),
+                             'specification': p['prod'].get('specification', ''),
+                             'sale_price': p['price'],
+                             'batch_no': order_batch,
+                             'unit_price': p['price']})
+            # record_id 为整数列，批次号字符串无法写入 → 用 None，批次号放入 new_data
+            AuditLog.log('stock_out', 'inventory', None,
+                         new_data={'batch_no': order_batch, 'count': len(done)},
+                         operator=operator)
+
+        return jsonify({'success': True, 'data': {'batch_no': order_batch, 'count': len(done), 'items': done}})
+    except ValueError as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
+    except Exception as e:
+        _logger.error(f"批量出库单失败: {traceback.format_exc()}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 # ==========================================
 #  交易记录 API
 # ==========================================
@@ -1021,8 +1141,10 @@ def api_upload():
                                 errors.append(f"第 {idx+2} 行: 数量为负({qty})，已跳过库存更新")
                             else:
                                 # 查询原库存（用于差异计算、流水记录，以及文件缺列时保留原有库位/阈值）
+                                # FOR UPDATE 行锁：Excel 全量覆盖模式下 diff=目标-当前 的读取必须锁定，
+                                # 否则两个导入并发时会按同一旧值算 diff，最后落库值 ≠ 文件目标值。
                                 old_inv = db.query_one(
-                                    "SELECT quantity, location, min_stock, max_stock FROM inventory WHERE product_id = %s",
+                                    "SELECT quantity, location, min_stock, max_stock FROM inventory WHERE product_id = %s FOR UPDATE",
                                     (prod_id,)
                                 )
                                 old_qty = old_inv['quantity'] if old_inv else 0
@@ -1688,7 +1810,8 @@ def _do_ai_set_quantity(sku, qty, notes=''):
     if not prod:
         raise ValueError(f'商品 {sku} 不存在')
     with db.transaction():
-        old = db.query_one("SELECT quantity FROM inventory WHERE product_id=%s", (prod['id'],))
+        # FOR UPDATE 行锁：消除「设为绝对值」读取旧值后并发算 delta 的丢失更新
+        old = db.query_one("SELECT quantity FROM inventory WHERE product_id=%s FOR UPDATE", (prod['id'],))
         old_qty = old['quantity'] if old else 0
         delta = qty - old_qty
         note = notes or f'AI调整库存至 {qty}'

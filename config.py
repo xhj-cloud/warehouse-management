@@ -29,5 +29,15 @@ UPLOAD_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'upload
 MAX_CONTENT_LENGTH = 50 * 1024 * 1024  # 最大上传 50MB
 ALLOWED_EXTENSIONS = {'xlsx', 'xls', 'csv'}
 
+# ==========================================
+# HTTP Basic 认证（防内网任意 curl 直接改库存/删数据）
+# ------------------------------------------
+# 生产/内网部署：务必设置 AUTH_USER / AUTH_PASSWORD；未设置时认证禁用并打印警告，
+# 仅用于纯本地快速联调。禁用方式：DISABLE_AUTH=true（回退到无认证，谨慎）。
+# ==========================================
+AUTH_USER = os.getenv('AUTH_USER', 'admin')
+AUTH_PASSWORD = os.getenv('AUTH_PASSWORD', '')      # 空则认证禁用（本地联调）
+AUTH_DISABLED = os.getenv('DISABLE_AUTH', '').lower() in ('1', 'true', 'yes')
+
 # 库存预警阈值
 LOW_STOCK_THRESHOLD = 10  # 低于此数量触发低库存预警
