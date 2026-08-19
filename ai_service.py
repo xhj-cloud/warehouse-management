@@ -67,7 +67,13 @@ class AIService:
             raise AIServiceError(f"AI 分析出错: {str(e)}") from None
 
     def _stream_completion(self, messages):
-        """低层流式调用：逐块 yield 内容增量字符串。
+        """低层流式调用：逐块 yield (kind, 文本)。
+
+        kind ∈ {'thinking','token'}：
+        - 'thinking'：模型的内心推理片段（reasoning_content）。Qwen3 思考型模型会先长时间
+          只产出 thinking、不产出 content；若不转发，前端在思考期会长时间"无任何输出"，
+          看起来像卡死/超时。因此把这两类都 yield，由上层区分展示。
+        - 'token'：正式回答内容（content）。
 
         连接失败/超时/HTTP 错误抛 AIServiceError（与 _call 一致，便于上层统一处理）。
         """
@@ -82,15 +88,13 @@ class AIService:
         try:
             with requests.post(url, json=payload, timeout=self.timeout, stream=True) as resp:
                 resp.raise_for_status()
-                # 关键：LM Studio 流式响应的 Content-Type 是 `text/event-stream`（无 charset=utf-8），
-                # requests 会把 resp.encoding 默认成 ISO-8859-1，若用 decode_unicode=True 逐行解码
-                # 会把中文解析成乱码。因此强制按字节读取，再手工按 UTF-8 解码每一行。
+                # 关键：LM Studio 流式响应 Content-Type 是 `text/event-stream`（无 charset=utf-8）。
+                # requests 会把 resp.encoding 默认成 ISO-8859-1，若 decode_unicode=True 逐行解码会乱码。
+                # 因此强制按字节读取，再手工按 UTF-8 解码每一行（一行就是一个完整 SSE 帧）。
                 for raw_line in resp.iter_lines(decode_unicode=False):
                     if not raw_line:
                         continue
-                    # 一行就是一个完整 SSE 事件，不会跨行拆散多字节字符
                     line = raw_line.decode('utf-8', errors='replace')
-                    # 只处理 "data: ..." 前缀的行
                     if line.startswith('data:'):
                         data_str = line[len('data:'):].strip()
                     else:
@@ -105,9 +109,12 @@ class AIService:
                     if not choices:
                         continue
                     delta = choices[0].get('delta', {}) or {}
+                    reasoning = delta.get('reasoning_content')
+                    if reasoning:
+                        yield ('thinking', reasoning)
                     content = delta.get('content')
                     if content:
-                        yield content
+                        yield ('token', content)
         except requests.exceptions.Timeout:
             raise AIServiceError("AI 分析服务超时，请稍后重试。") from None
         except requests.exceptions.ConnectionError:
@@ -134,7 +141,7 @@ class AIService:
         因此流式过程中遇到 action 围栏后停止继续推送，把剩余部分积攒下来最后统一解析。
         """
         context = self.build_inventory_context()
-        system_prompt = f"""你是一个专业的仓库库存管理助手，可以管理库存、供应商和客户。当前数据：
+        system_prompt = f"""你是一个专业的仓库库存管理助手，可以管理库存、供应商和客户。请尽量简短思考、直接作答。当前数据：
 {context}
 
 操作指令格式（放在回复末尾）：
@@ -164,9 +171,14 @@ class AIService:
             {'role': 'user', 'content': user_message},
         ]
         full = ''
-        yielded = 0          # full 中已经推送给前端的长度（避免围栏触发时重复推送）
+        yielded = 0          # full 中已经推送给前端的正文长度（避免围栏触发时重复推送）
         in_action = False
-        for delta in self._stream_completion(messages):
+        for kind, delta in self._stream_completion(messages):
+            if kind == 'thinking':
+                # 内心推理：单独转发给前端作为"思考中"进度，不进正文、不参与围栏判断
+                yield {'type': 'thinking', 'content': delta}
+                continue
+            # kind == 'token'：正式回答
             full += delta
             if not in_action:
                 # 一旦出现 action 围栏，说明正文到此为止，后面全是指令 JSON
@@ -310,7 +322,8 @@ class AIService:
 
         prompt = prompts.get(query_type, prompts['general'])
         return [
-            {'role': 'system', 'content': '你是一个专业的仓库库存管理分析助手，擅长数据分析和管理建议。请始终用中文回答。'},
+            {'role': 'system', 'content': '你是一个专业的仓库库存管理分析助手，擅长数据分析和管理建议。请始终用中文回答。'
+                                         '注意：请直接给出结论和可执行建议，尽量简短思考、不要长篇输出内心推理过程，聚焦干货。'},
             {'role': 'user', 'content': prompt},
         ]
 
@@ -328,15 +341,19 @@ class AIService:
 
     def analyze_stream(self, query_type='general'):
         """流式库存分析。逐段 yield 事件：
-            {'type':'token','content':...}  分析正文增量
-            {'type':'done','data':...}      完整分析正文
-        分析较长，改用流式可避免 60s 超时，边生成边显示。
+            {'type':'thinking','content':...}  模型内心推理（思考中进度）
+            {'type':'token','content':...}      分析正文增量
+            {'type':'done','data':...}          完整分析正文
+        分析较长，改用流式可避免 60s 超时；思考型模型的推理也转发，避免思考期"无输出"像卡死。
         """
         messages = self._build_analyze_messages(query_type)
         full = ''
-        for delta in self._stream_completion(messages):
-            full += delta
-            yield {'type': 'token', 'content': delta}
+        for kind, delta in self._stream_completion(messages):
+            if kind == 'thinking':
+                yield {'type': 'thinking', 'content': delta}
+            else:
+                full += delta
+                yield {'type': 'token', 'content': delta}
         yield {'type': 'done', 'data': full}
 
     def chat(self, user_message):
@@ -345,7 +362,7 @@ class AIService:
         AI 返回 JSON 指令时自动执行，否则正常回复。
         """
         context = self.build_inventory_context()
-        system_prompt = f"""你是一个专业的仓库库存管理助手，可以管理库存、供应商和客户。当前数据：
+        system_prompt = f"""你是一个专业的仓库库存管理助手，可以管理库存、供应商和客户。请尽量简短思考、直接作答。当前数据：
 {context}
 
 操作指令格式（放在回复末尾）：

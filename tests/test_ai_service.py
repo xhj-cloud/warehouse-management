@@ -237,7 +237,8 @@ class TestChatStream:
 
         def fake_stream(self, messages):
             for c in chunks:
-                yield c
+                # 现在 _stream_completion 产出 (kind, text) 二元的（thinking/token）
+                yield ('token', c)
 
         monkeypatch.setattr(ai_mod.AIService, '_stream_completion', fake_stream)
 
@@ -249,6 +250,26 @@ class TestChatStream:
         assert tokens == '你好，我是助手'
         assert done['reply'] == '你好，我是助手'
         assert done['actions'] is None
+
+    def test_forward_thinking_events(self, svc, monkeypatch):
+        # 混合 thinking + token：thinking 单独解包为 thinking 事件，不混入正文
+        def fake_stream(self, messages):
+            yield ('thinking', '思考中')
+        monkeypatch.setattr(ai_mod.AIService, '_stream_completion', fake_stream)
+        # build_inventory_context 需要 DB：mock 掉
+        monkeypatch.setattr(ai_mod.InventoryModel, 'get_all', lambda: [])
+        monkeypatch.setattr(ai_mod.StatsModel, 'get_dashboard', lambda: {
+            'total_products': 1, 'total_categories': 1, 'total_quantity': 10, 'low_stock_count': 0})
+        monkeypatch.setattr(ai_mod.InventoryModel, 'get_low_stock', lambda: [])
+        monkeypatch.setattr(ai_mod.TransactionModel, 'get_all', lambda limit=30: [])
+        monkeypatch.setattr(ai_mod.SupplierModel, 'get_all', lambda: [])
+        monkeypatch.setattr(ai_mod.CustomerModel, 'get_all', lambda: [])
+        # 只 yield thinking，不 yield token → 正文应为空
+        events = [e for e in svc.chat_stream('hi')]
+        th = [e['content'] for e in events if e['type'] == 'thinking']
+        assert th and '思考中' in th[0]
+        done = [e for e in events if e['type'] == 'done'][0]
+        assert done['reply'] == ''   # 没有任何 token → 正文为空
 
     def test_streams_reply_and_splits_at_action_fence(self, svc, monkeypatch):
         chunks = ['已为您入库。\n', '```action\n',
@@ -289,7 +310,8 @@ class TestAnalyzeStream:
 
         def fake_stream(self, messages):
             for c in chunks:
-                yield c
+                # _stream_completion 产出 (kind, text) 二元组
+                yield ('token', c)
         monkeypatch.setattr(ai_mod.AIService, '_stream_completion', fake_stream)
 
     def test_streams_tokens_and_done(self, svc, monkeypatch):
@@ -299,3 +321,23 @@ class TestAnalyzeStream:
         done = [e for e in events if e['type'] == 'done'][0]
         assert tokens == '第一段低库存分析结果'
         assert done['data'] == '第一段低库存分析结果'
+
+    def test_forward_analyze_thinking(self, svc, monkeypatch):
+        def fake_stream(self, messages):
+            yield ('thinking', '先思考')
+            yield ('token', '结论')
+        monkeypatch.setattr(ai_mod.AIService, '_stream_completion', fake_stream)
+        monkeypatch.setattr(ai_mod.InventoryModel, 'get_all', lambda: [])
+        monkeypatch.setattr(ai_mod.StatsModel, 'get_dashboard', lambda: {
+            'total_products': 1, 'total_categories': 1, 'total_quantity': 10, 'low_stock_count': 0})
+        monkeypatch.setattr(ai_mod.InventoryModel, 'get_low_stock', lambda: [])
+        monkeypatch.setattr(ai_mod.TransactionModel, 'get_all', lambda limit=30: [])
+        monkeypatch.setattr(ai_mod.SupplierModel, 'get_all', lambda: [])
+        monkeypatch.setattr(ai_mod.CustomerModel, 'get_all', lambda: [])
+        events = [e for e in svc.analyze_stream('low_stock')]
+        th = [e['content'] for e in events if e['type'] == 'thinking']
+        tk = ''.join(e['content'] for e in events if e['type'] == 'token')
+        done = [e for e in events if e['type'] == 'done'][0]
+        assert th == ['先思考']
+        assert tk == '结论'
+        assert done['data'] == '结论'

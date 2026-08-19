@@ -767,24 +767,41 @@ async function checkAIHealth() {
 
 async function runAIAnalysis(type) {
     const container = $('#ai-result');
-    container.innerHTML = '<div style="text-align:center;padding:40px;color:#94a3b8;">🤖 AI 正在分析中，请稍候...</div>';
+    container.innerHTML = '<div style="text-align:center;padding:40px;color:#94a3b8;">🤖 AI 正在思考中，请稍候...</div>';
 
     let acc = '';
+    let thinking = '';
+    let gotContent = false;
     streamSSE(
         `${API}/ai/analyze/stream?type=${encodeURIComponent(type)}`,
-        // 增量：实时刷新（同样先整体转义再渲染，防 AI 回显的商品名造成存储型 XSS）
+        // 正式回答增量：实时渲染（先整体转义，防 AI 回显的商品名造成存储型 XSS）
         (chunk) => {
+            gotContent = true;
             acc += chunk;
             container.innerHTML = `<div style="white-space:pre-wrap;line-height:1.8;font-size:14px;">${renderChatReply(acc)}</div>`;
         },
         // 结束：用完整文本最终渲染（收敛 markdown 链接等）
         (full) => {
             acc = full;
+            gotContent = true;
             container.innerHTML = `<div style="white-space:pre-wrap;line-height:1.8;font-size:14px;">${renderChatReply(full)}</div>`;
         },
         // 出错
         (err) => {
             container.innerHTML = `<div style="color:var(--danger);padding:20px;">分析失败: ${escapeHtml(err)}</div>`;
+            container.innerHTML += thinking ? `<div style="margin-top:12px;font-size:12px;color:#64748b;white-space:pre-wrap;">${escapeHtml('（模型已思考的部分）\n'+thinking)}</div>` : '';
+        },
+        // 思考中进度：正式回答未开始时，实时展示已推理内容，避免"无输出"像卡死
+        {},
+        (thk) => {
+            if (gotContent) return;             // 已有正式回答就不再刷思考
+            thinking += thk;
+            const t = thinking.trim();
+            const show = t.length > 24 ? t.slice(-24) + '…' : t;  // 只显示末尾，避免刷屏
+            container.innerHTML = '<div style="text-align:center;color:#94a3b8;">🤖 AI 正在思考中…</div>'
+                + `<div style="margin-top:10px;font-size:12px;color:#64748b;white-space:pre-wrap;max-height:160px;overflow:auto;">${escapeHtml(show)}</div>`;
+            const el = container.querySelector('div:last-child');
+            if (el) el.scrollTop = el.scrollHeight;
         }
     );
 }
@@ -801,12 +818,12 @@ function renderChatReply(text) {
         '<a href="$2" target="_blank" rel="noopener">$1</a>');
 }
 
-// 流式拉取 AI 回复（SSE）。onToken(content) 收到增量，onDone(full, log) 结尾触发，onError(err) 出错。
 // 通用 SSE 流式请求。path=相对 URL，init=fetch 选项，回调：
-//   onToken(content)  收到 {"type":"token","content":...} 的增量
-//   onDone(data)      收到 {"type":"done","data":...}
-//   onError(err)      出错
-function streamSSE(path, onToken, onDone, onError, init = {}) {
+//   onToken(content)    收到 {"type":"token","content":...} 的增量（正式回答）
+//   onDone(data)        收到 {"type":"done","data":...}
+//   onError(err)        出错
+//   onThinking(content) 可选：收到 {"type":"thinking","content":...} 的推理进度
+function streamSSE(path, onToken, onDone, onError, init = {}, onThinking) {
     const controller = new AbortController();
     // 流式请求可能有较长的空闲间隔，给足 10 分钟
     const timer = setTimeout(() => controller.abort(), 600000);
@@ -840,6 +857,7 @@ function streamSSE(path, onToken, onDone, onError, init = {}) {
                     let ev;
                     try { ev = JSON.parse(payload); } catch (_) { continue; }
                     if (ev.type === 'token') onToken(ev.content || '');
+                    else if (ev.type === 'thinking') { if (onThinking) onThinking(ev.content || ''); }
                     else if (ev.type === 'log') { /* 不单独展示，done 里已含执行日志 */ }
                     else if (ev.type === 'done') { onDone(ev.data || ''); return; }
                     else if (ev.type === 'error') { lastError = ev.error || 'AI 分析出错'; }

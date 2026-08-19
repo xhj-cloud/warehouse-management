@@ -1616,13 +1616,22 @@ def api_ai_analyze_stream():
 
     def _generate():
         try:
+            _cnt = {'token': 0, 'thinking': 0, 'done': 0}
             for ev in ai_service.analyze_stream(query_type):
-                if ev['type'] == 'token':
+                t = ev['type']
+                _cnt[t] = _cnt.get(t, 0) + 1
+                if t == 'token':
                     try:
                         yield _sse({'type': 'token', 'content': ev['content']})
                     except GeneratorExit:
                         return
-                elif ev['type'] == 'done':
+                elif t == 'thinking':
+                    try:
+                        yield _sse({'type': 'thinking', 'content': ev['content']})
+                    except GeneratorExit:
+                        return
+                elif t == 'done':
+                    _logger.info(f"[analyze_stream] done len={len(ev['data'])} counts={_cnt}")
                     yield _sse({'type': 'done', 'data': ev['data']})
                     return
             return
