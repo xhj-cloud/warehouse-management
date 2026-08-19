@@ -6,7 +6,9 @@ Flask API 端点测试：使用 test_client + mock 模型层，不依赖真实�
 避免状态泄漏到其他测试文件。
 """
 
+import json
 import os
+import re
 from io import BytesIO
 from types import SimpleNamespace
 
@@ -25,6 +27,54 @@ def make_recorder(result=None):
 
     rec.calls = calls
     return rec
+
+
+def track_tx(fake_db, monkeypatch):
+    """包装 fake_db.execute，记录每条写 SQL 执行时是否处于事务内 → [(sql, in_transaction), ...]"""
+    log = []
+    orig = fake_db.execute
+
+    def tracking(sql, params=None):
+        r = orig(sql, params)
+        log.append((sql, fake_db.in_transaction))
+        return r
+
+    monkeypatch.setattr(fake_db, 'execute', tracking)
+    return log
+
+
+def patch_all_dbs(app_mod, fake_db, monkeypatch):
+    """把 app.db 和 models.db 都指向同一个 FakeDB。
+
+    app.py 里 `from models import db`，模型方法引用的是 models 模块内的 db；
+    只 patch app_mod.db 时，真实模型方法仍会连真库。
+    """
+    import models as models_mod
+    monkeypatch.setattr(models_mod, 'db', fake_db)
+    monkeypatch.setattr(app_mod, 'db', fake_db)
+
+
+def make_stateful_inventory(fake_db, monkeypatch, initial_qty=0):
+    """让 FakeDB 模拟真实库存状态：原子增减 SQL 会更新 state，SELECT quantity 回读当前值。"""
+    state = {'qty': initial_qty}
+    orig_execute = fake_db.execute
+
+    def smart_execute(sql, params=None):
+        r = orig_execute(sql, params)
+        if 'quantity = quantity + %s' in sql:
+            state['qty'] += params[0]
+        elif 'quantity = quantity - %s' in sql and r[0]:
+            state['qty'] -= params[0]
+        elif 'ON DUPLICATE KEY UPDATE' in sql and 'VALUES(quantity)' in sql:
+            state['qty'] += params[1]   # (product_id, qty)
+        return r
+
+    monkeypatch.setattr(fake_db, 'execute', smart_execute)
+    fake_db.one_side_effect = (
+        lambda sql, params=None: {'quantity': state['qty']}
+        if 'SELECT quantity FROM inventory' in sql else None
+    )
+    return state
 
 
 def make_xlsx(rows):
@@ -520,6 +570,8 @@ class TestAI:
 
         create = make_recorder(9)
         monkeypatch.setattr(app_mod.SupplierModel, 'create', create)
+        # 去重检查：名称不存在 → 走创建分支
+        monkeypatch.setattr(app_mod.SupplierModel, 'get_by_name', make_recorder(None))
 
         resp = client.post('/api/ai/chat', json={'message': '新增供应商华为，联系人张经理'})
         assert resp.status_code == 200
@@ -528,7 +580,7 @@ class TestAI:
         assert '已执行' in body['data']
         assert create.calls[0]['args'][0] == '华为'
 
-    def test_chat_stock_in_auto_category(self, app_mod, client, monkeypatch):
+    def test_chat_stock_in_auto_category(self, app_mod, client, fake_db, monkeypatch):
         reply_text = (
             '好的，已入库。\n'
             '```action\n'
@@ -545,6 +597,8 @@ class TestAI:
         monkeypatch.setattr(app_mod.CategoryModel, 'create', cat_create)
         monkeypatch.setattr(app_mod.ProductModel, 'create', prod_create)
         monkeypatch.setattr(app_mod.InventoryModel, 'stock_in', stock_in)
+        # _do_ai_stock_in 整体包在 db.transaction() 内 → 用 FakeDB 承接
+        monkeypatch.setattr(app_mod, 'db', fake_db)
 
         resp = client.post('/api/ai/chat', json={'message': '入库 5 个电阻 10K'})
         assert resp.status_code == 200
@@ -570,7 +624,8 @@ class TestAI:
 
         cust_create = make_recorder(3)
         stock_out = make_recorder(None)
-        monkeypatch.setattr(app_mod.CustomerModel, 'get_all', make_recorder([]))
+        # 客户按名称查找（预检通过后才在事务内建客户）：不存在 → 走创建分支
+        monkeypatch.setattr(app_mod.CustomerModel, 'get_by_name', make_recorder(None))
         monkeypatch.setattr(app_mod.CustomerModel, 'create', cust_create)
         monkeypatch.setattr(app_mod.ProductModel, 'get_by_sku', make_recorder(
             {'id': 7, 'name': '螺丝 M6', 'specification': '不锈钢'}))
@@ -595,3 +650,456 @@ class TestAI:
         files = os.listdir(tmp_path)
         assert any(f.startswith('出库单_中建公司') and f.endswith('.xlsx') for f in files)
         assert '/uploads/' in body['data']
+
+
+# ==========================================
+#  回归：删除商品连带清理库存行（孤儿库存）
+# ==========================================
+class TestProductDeleteAPI:
+    def test_delete_product_removes_inventory_row_in_same_tx(self, app_mod, client, fake_db, monkeypatch):
+        """回归 #2：删商品必须同事务内删掉 inventory 行，否则仪表盘总数量永久虚增"""
+        monkeypatch.setattr(app_mod.ProductModel, 'get_by_id', make_recorder({'id': 5, 'name': '螺丝 M6'}))
+        tx_log = track_tx(fake_db, monkeypatch)
+        patch_all_dbs(app_mod, fake_db, monkeypatch)
+
+        resp = client.delete('/api/products/5')
+        assert resp.status_code == 200 and resp.get_json()['success'] is True
+
+        prod_hits = fake_db.find_executed('DELETE FROM products WHERE id=%s')
+        inv_hits = fake_db.find_executed('DELETE FROM inventory WHERE product_id=%s')
+        assert len(prod_hits) == 1 and prod_hits[0][1] == (5,)
+        assert len(inv_hits) == 1 and inv_hits[0][1] == (5,)
+        # 两条删除都必须发生在同一事务内
+        for sql, in_tx in tx_log:
+            if 'DELETE FROM' in sql:
+                assert in_tx is True
+
+
+# ==========================================
+#  回归：Excel 导入（价格保留 + 原子增减）
+# ==========================================
+class TestExcelImportFixes:
+    def _patch(self, app_mod, fake_db, monkeypatch, existing=None):
+        monkeypatch.setattr(app_mod.CategoryModel, 'get_all', make_recorder([]))
+        monkeypatch.setattr(app_mod.ProductModel, 'get_by_sku', make_recorder(existing))
+        monkeypatch.setattr(app_mod.ProductModel, 'create', make_recorder(1))
+        monkeypatch.setattr(app_mod.ExcelUploadModel, 'create', make_recorder(7))
+        monkeypatch.setattr(app_mod.ExcelUploadModel, 'update_status', make_recorder(None))
+        patch_all_dbs(app_mod, fake_db, monkeypatch)
+
+    def test_reimport_existing_sku_preserves_price_and_supplier(self, app_mod, client, fake_db, monkeypatch):
+        """回归 #1：重新导入已有 SKU 不得把价格清零、供应商抹掉（文件没有这些列）"""
+        existing = {'id': 9, 'category_id': 3, 'supplier_id': 4}
+        self._patch(app_mod, fake_db, monkeypatch, existing=existing)
+        buf = make_xlsx([['商品名称', 'SKU', '数量'], ['螺丝 M6', 'S1', 50]])
+
+        resp = client.post('/api/upload', data={'file': (buf, 't.xlsx'), 'mode': 'replace'},
+                           content_type='multipart/form-data')
+        assert resp.status_code == 200 and resp.get_json()['success'] is True
+
+        hits = fake_db.find_executed('UPDATE products SET')
+        assert len(hits) == 1
+        sql, params = hits[0]
+        # 价格列不得出现在 SQL 中（None → 保留原值）
+        assert 'unit_price' not in sql and 'sale_price' not in sql
+        # 参数顺序 name, sku, cat_id, sup_id, unit, spec, desc, id：分类/供应商保留原值
+        assert params[2] == 3 and params[3] == 4
+
+    def test_new_product_uses_atomic_increment(self, app_mod, client, fake_db, monkeypatch):
+        """回归 #4：库存写入必须用原子自增，禁止绝对值 SET quantity=%s（并发丢更新）"""
+        self._patch(app_mod, fake_db, monkeypatch)
+        buf = make_xlsx([['商品名称', '数量'], ['螺丝 M6', 50]])
+
+        resp = client.post('/api/upload', data={'file': (buf, 't.xlsx'), 'mode': 'replace'},
+                           content_type='multipart/form-data')
+        assert resp.status_code == 200
+
+        inc = fake_db.find_executed('UPDATE inventory SET quantity = quantity + %s')
+        assert len(inc) == 1 and inc[0][1] == (50, 1)   # diff=50（原库存 0）, prod_id=1
+        assert not any('SET quantity=%s' in s for s, _ in fake_db.executed)
+
+    def test_replace_mode_decrement_uses_guarded_atomic_update(self, app_mod, client, fake_db, monkeypatch):
+        """回归 #4：replace 模式文件数量低于现库存 → 带条件的原子扣减，流水 before/after 以实际值为准"""
+        self._patch(app_mod, fake_db, monkeypatch, existing={'id': 9})
+        state = make_stateful_inventory(fake_db, monkeypatch, initial_qty=80)
+        buf = make_xlsx([['商品名称', 'SKU', '数量'], ['螺丝 M6', 'S1', 30]])
+
+        resp = client.post('/api/upload', data={'file': (buf, 't.xlsx'), 'mode': 'replace'},
+                           content_type='multipart/form-data')
+        assert resp.status_code == 200 and resp.get_json()['success'] is True
+
+        dec = fake_db.find_executed(
+            'UPDATE inventory SET quantity = quantity - %s WHERE product_id=%s AND quantity >= %s')
+        assert len(dec) == 1 and dec[0][1] == (50, 9, 50)   # 减 50，条件 quantity>=50
+        assert state['qty'] == 30
+
+        txn = fake_db.find_executed('INSERT INTO transactions')
+        assert len(txn) == 1
+        p = txn[0][1]
+        assert (p[0], p[1], p[2]) == (9, 'out', 50)   # product_id, type, qty
+        assert (p[3], p[4]) == (80, 30)               # before, after
+
+    def test_replace_mode_insufficient_stock_skips_row(self, app_mod, client, fake_db, monkeypatch):
+        """回归 #4：并发下库存不足以扣减 → 跳过该行库存写入并报错，不产生流水"""
+        self._patch(app_mod, fake_db, monkeypatch, existing={'id': 9})
+        make_stateful_inventory(fake_db, monkeypatch, initial_qty=80)
+        buf = make_xlsx([['商品名称', 'SKU', '数量'], ['螺丝 M6', 'S1', 30]])
+
+        # 条件扣减未命中（并发已把库存扣走）→ 库存不足
+        orig_execute = fake_db.execute
+
+        def guarded(sql, params=None):
+            r = orig_execute(sql, params)
+            if 'quantity - %s' in sql:
+                return (0, r[1])
+            return r
+        monkeypatch.setattr(fake_db, 'execute', guarded)
+
+        resp = client.post('/api/upload', data={'file': (buf, 't.xlsx'), 'mode': 'replace'},
+                           content_type='multipart/form-data')
+        assert resp.status_code == 200
+        body = resp.get_json()
+        assert any('库存不足' in e for e in body['data']['errors'])
+        assert not fake_db.find_executed('INSERT INTO transactions')
+
+    def test_increment_mode_accumulates(self, app_mod, client, fake_db, monkeypatch):
+        """回归 #4：increment 模式文件数量是新增量 → 原子累加"""
+        self._patch(app_mod, fake_db, monkeypatch, existing={'id': 9})
+        state = make_stateful_inventory(fake_db, monkeypatch, initial_qty=80)
+        buf = make_xlsx([['商品名称', 'SKU', '数量'], ['螺丝 M6', 'S1', 5]])
+
+        resp = client.post('/api/upload', data={'file': (buf, 't.xlsx'), 'mode': 'increment'},
+                           content_type='multipart/form-data')
+        assert resp.status_code == 200
+
+        inc = fake_db.find_executed('UPDATE inventory SET quantity = quantity + %s')
+        assert len(inc) == 1 and inc[0][1] == (5, 9)
+        assert state['qty'] == 85
+
+
+# ==========================================
+#  回归：AI 智能导入（价格保留 + 原子自增）
+# ==========================================
+class TestAISmartImportFixes:
+    def test_reimport_preserves_price_and_atomic_increment(self, app_mod, client, fake_db, monkeypatch):
+        """回归 #1/#4：已有商品 → 保留价格/分类/供应商；库存用 ON DUPLICATE KEY 原子自增"""
+        items = [{'name': '螺丝 M6', 'sku': 'S1', 'quantity': 5, 'price': 2.0}]
+        monkeypatch.setattr(app_mod.ai_service, 'smart_import', lambda text: items)
+        existing = {'id': 9, 'category_id': 3, 'supplier_id': 4}
+        monkeypatch.setattr(app_mod.ProductModel, 'get_by_sku', make_recorder(existing))
+        monkeypatch.setattr(app_mod.CategoryModel, 'get_all', make_recorder([]))
+        monkeypatch.setattr(app_mod.SupplierModel, 'get_all', make_recorder([]))
+        state = make_stateful_inventory(fake_db, monkeypatch, initial_qty=20)
+        patch_all_dbs(app_mod, fake_db, monkeypatch)
+
+        resp = client.post('/api/ai/smart-import', json={'text': '采购螺丝 M6 5 个'})
+        assert resp.status_code == 200 and resp.get_json()['success'] is True
+
+        hits = fake_db.find_executed('UPDATE products SET')
+        assert len(hits) == 1
+        sql, params = hits[0]
+        assert 'unit_price' not in sql and 'sale_price' not in sql
+        # 参数顺序 name, sku, cat_id, sup_id, ...：分类/供应商保留原值
+        assert params[2] == 3 and params[3] == 4
+
+        dup = fake_db.find_executed('ON DUPLICATE KEY UPDATE quantity = quantity + VALUES(quantity)')
+        assert len(dup) == 1 and dup[0][1] == (9, 5)
+        assert state['qty'] == 25
+
+
+# ==========================================
+#  回归：SKU 兜底生成防碰撞
+# ==========================================
+class TestUniqueSkuFallback:
+    def test_unique_sku_appends_suffix_on_collision(self, app_mod, monkeypatch):
+        """回归 #5：兜底 SKU 已被占用 → 追加 -2/-3...，避免库存并入别的商品"""
+        taken = {'BASE', 'BASE-2'}
+
+        def fake_get_by_sku(sku):
+            return {'id': 1} if sku in taken else None
+        monkeypatch.setattr(app_mod.ProductModel, 'get_by_sku', fake_get_by_sku)
+
+        assert app_mod._unique_sku('BASE') == 'BASE-3'
+        assert app_mod._unique_sku('FREE') == 'FREE'
+
+    def test_inbound_recognize_no_collision_for_same_prefix_names(self, app_mod, client, fake_db, monkeypatch):
+        """回归 #5：前 6 字相同的两个中文商品名不得合并到同一 SKU"""
+        items = [{'name': '超长中文商品名称甲', 'quantity': 1},
+                 {'name': '超长中文商品名称乙', 'quantity': 2}]
+        monkeypatch.setattr(app_mod.ai_service, 'recognize_inbound_image', lambda b64: items)
+
+        created_skus = []
+        orig_execute = fake_db.execute
+
+        def tracking_execute(sql, params=None):
+            r = orig_execute(sql, params)
+            if sql.lstrip().upper().startswith('INSERT INTO PRODUCTS'):
+                created_skus.append(params[1])   # (name, sku, ...)
+            return r
+        monkeypatch.setattr(fake_db, 'execute', tracking_execute)
+
+        def one(sql, params=None):
+            if 'WHERE sku = %s' in sql:
+                return {'id': 99} if params[0] in created_skus else None
+            return None
+        fake_db.one_side_effect = one
+        patch_all_dbs(app_mod, fake_db, monkeypatch)
+
+        resp = client.post('/api/ai/inbound-recognize', json={'image': 'x'})
+        assert resp.status_code == 200
+        body = resp.get_json()
+        assert body['success'] is True and body['data']['count'] == 2
+        skus = [i['sku'] for i in body['data']['imported']]
+        assert len(set(skus)) == 2, f'两个商品不得共用同一 SKU: {skus}'
+
+
+# ==========================================
+#  回归：供应商/客户导入去重（upsert）
+# ==========================================
+class TestUploadDedup:
+    def _track_names(self, app_mod, fake_db, monkeypatch, table, initial=()):
+        """有状态 FakeDB：跟踪已插入该表的名称，get_by_name 按此命中"""
+        names = set(initial)
+        orig_execute = fake_db.execute
+
+        def tracking_execute(sql, params=None):
+            r = orig_execute(sql, params)
+            if sql.lstrip().upper().startswith(f'INSERT INTO {table.upper()}'):
+                names.add(params[0])
+            return r
+        monkeypatch.setattr(fake_db, 'execute', tracking_execute)
+
+        def one(sql, params=None):
+            if f'FROM {table} WHERE name=%s' in sql:
+                if params[0] in names:
+                    return {'id': 1, 'name': params[0], 'contact_person': '', 'phone': '',
+                            'email': '', 'address': '', 'notes': ''}
+            return None
+        fake_db.one_side_effect = one
+        patch_all_dbs(app_mod, fake_db, monkeypatch)
+
+    @staticmethod
+    def _csv(rows):
+        import csv as _csv
+        from io import StringIO
+        sio = StringIO()
+        w = _csv.writer(sio)
+        for r in rows:
+            w.writerow(r)
+        # utf-8-sig（带 BOM）与 Excel 导出的 CSV 一致，走 pd.read_csv 的 utf-8-sig 分支
+        return BytesIO(sio.getvalue().encode('utf-8-sig'))
+
+    def test_supplier_upload_reupload_updates_not_duplicates(self, app_mod, client, fake_db, monkeypatch):
+        """回归 #6：重复上传同一供应商文件 → 更新原记录，不再产生重复"""
+        self._track_names(app_mod, fake_db, monkeypatch, 'suppliers')
+
+        r1 = client.post('/api/upload/suppliers', data={'file': (self._csv([['名称', '电话'], ['华为', '13800000000']]), 's.csv')},
+                         content_type='multipart/form-data')
+        assert r1.status_code == 200
+        d1 = r1.get_json()['data']
+        assert d1['created'] == 1 and d1['updated'] == 0
+
+        # test client 会关闭上传文件 → 第二次用新 buffer
+        r2 = client.post('/api/upload/suppliers', data={'file': (self._csv([['名称', '电话'], ['华为', '13800000000']]), 's.csv')},
+                         content_type='multipart/form-data')
+        d2 = r2.get_json()['data']
+        assert d2['created'] == 0 and d2['updated'] == 1
+
+        # 两次上传合计：只 INSERT 一次、UPDATE 一次
+        assert len(fake_db.find_executed('INSERT INTO suppliers')) == 1
+        assert len(fake_db.find_executed('UPDATE suppliers SET')) == 1
+
+    def test_customer_upload_reupload_updates_not_duplicates(self, app_mod, client, fake_db, monkeypatch):
+        """回归 #6：客户同理"""
+        self._track_names(app_mod, fake_db, monkeypatch, 'customers')
+
+        r1 = client.post('/api/upload/customers', data={'file': (self._csv([['名称', '电话'], ['中建公司', '13900000000']]), 'c.csv')},
+                         content_type='multipart/form-data')
+        assert r1.status_code == 200
+        d1 = r1.get_json()['data']
+        assert d1['created'] == 1 and d1['updated'] == 0
+
+        r2 = client.post('/api/upload/customers', data={'file': (self._csv([['名称', '电话'], ['中建公司', '13900000000']]), 'c.csv')},
+                         content_type='multipart/form-data')
+        d2 = r2.get_json()['data']
+        assert d2['created'] == 0 and d2['updated'] == 1
+
+    def test_ai_add_supplier_skips_existing(self, app_mod, client, fake_db, monkeypatch):
+        """回归 #6：AI add_supplier 名称已存在 → 跳过，不覆盖"""
+        reply = '好的。\n```action\n[{"action": "add_supplier", "name": "华为"}]\n```\n'
+        monkeypatch.setattr(app_mod.ai_service, 'chat', lambda msg: reply)
+        self._track_names(app_mod, fake_db, monkeypatch, 'suppliers', initial=('华为',))
+
+        resp = client.post('/api/ai/chat', json={'message': '新增供应商华为'})
+        body = resp.get_json()
+        assert any('已存在' in a for a in body['actions'])
+        assert not fake_db.find_executed('INSERT INTO suppliers')
+
+    def test_ai_add_customer_skips_existing(self, app_mod, client, fake_db, monkeypatch):
+        """回归 #6：AI add_customer 名称已存在 → 跳过，不覆盖"""
+        reply = '好的。\n```action\n[{"action": "add_customer", "name": "中建公司"}]\n```\n'
+        monkeypatch.setattr(app_mod.ai_service, 'chat', lambda msg: reply)
+        self._track_names(app_mod, fake_db, monkeypatch, 'customers', initial=('中建公司',))
+
+        resp = client.post('/api/ai/chat', json={'message': '新增客户中建公司'})
+        body = resp.get_json()
+        assert any('已存在' in a for a in body['actions'])
+        assert not fake_db.find_executed('INSERT INTO customers')
+
+
+# ==========================================
+#  回归：AI create_order 先预检后建客户
+# ==========================================
+class TestAICreateOrderPrecheckFirst:
+    @staticmethod
+    def _chat_reply(app_mod, monkeypatch, action_obj):
+        reply = '好的。\n```action\n' + json.dumps([action_obj], ensure_ascii=False) + '\n```\n'
+        monkeypatch.setattr(app_mod.ai_service, 'chat', lambda msg: reply)
+
+    def test_failed_precheck_creates_no_customer(self, app_mod, client, fake_db, monkeypatch):
+        """回归 #7：预检失败（商品不存在）时不得创建客户，不留垃圾数据"""
+        self._chat_reply(app_mod, monkeypatch, {
+            'action': 'create_order', 'customer': '新客户X', 'operator': 'AI',
+            'items': [{'sku': 'NOPE-1', 'quantity': 2}]})
+        cust_create = make_recorder(3)
+        monkeypatch.setattr(app_mod.CustomerModel, 'get_by_name', make_recorder(None))
+        monkeypatch.setattr(app_mod.CustomerModel, 'create', cust_create)
+        monkeypatch.setattr(app_mod.ProductModel, 'get_by_sku', make_recorder(None))
+        monkeypatch.setattr(app_mod, 'db', fake_db)
+
+        resp = client.post('/api/ai/chat', json={'message': '创建出库单'})
+        body = resp.get_json()
+        assert any('出库单未执行' in a for a in body['actions'])
+        assert cust_create.calls == []          # 没有留下垃圾客户
+        assert not fake_db.find_executed('INSERT INTO customers')
+
+    def test_existing_customer_reused_not_created(self, app_mod, client, tmp_path, fake_db, monkeypatch):
+        """回归 #7：客户已存在 → 复用其 id，不新建"""
+        self._chat_reply(app_mod, monkeypatch, {
+            'action': 'create_order', 'customer': '中建公司', 'operator': '张三',
+            'items': [{'sku': 'SCR-1', 'quantity': 2, 'price': 0.5}]})
+        cust_create = make_recorder(3)
+        stock_out = make_recorder(None)
+        monkeypatch.setattr(app_mod.CustomerModel, 'get_by_name', make_recorder({'id': 8}))
+        monkeypatch.setattr(app_mod.CustomerModel, 'create', cust_create)
+        monkeypatch.setattr(app_mod.ProductModel, 'get_by_sku', make_recorder(
+            {'id': 7, 'name': '螺丝 M6', 'specification': ''}))
+        monkeypatch.setattr(app_mod.InventoryModel, 'stock_out', stock_out)
+        fake_db.one_side_effect = lambda sql, params=None: {'quantity': 10}
+        monkeypatch.setattr(app_mod, 'db', fake_db)
+        monkeypatch.setattr(app_mod, 'UPLOAD_FOLDER', str(tmp_path))
+
+        resp = client.post('/api/ai/chat', json={'message': '创建出库单'})
+        body = resp.get_json()
+        assert resp.status_code == 200 and body['success'] is True
+        assert cust_create.calls == []          # 复用已有客户 id=8
+        so = stock_out.calls[0]
+        assert so['kwargs']['customer_id'] == 8
+
+
+# ==========================================
+#  回归：AI chat 动作原子性（事务 + set_quantity 原子增量）
+# ==========================================
+class TestAIChatActionsAtomicity:
+    def test_stock_in_writes_all_in_one_transaction(self, app_mod, client, fake_db, monkeypatch):
+        """回归 #3：AI 入库的全部写入（建商品+库存自增+流水）必须在同一事务内"""
+        reply = ('好的。\n```action\n[{"action": "stock_in", "sku": "NEW-9", "quantity": 5, '
+                 '"name": "测试品"}]\n```\n')
+        monkeypatch.setattr(app_mod.ai_service, 'chat', lambda msg: reply)
+        monkeypatch.setattr(app_mod.ProductModel, 'get_by_sku', make_recorder(None))
+        tx_log = track_tx(fake_db, monkeypatch)
+        patch_all_dbs(app_mod, fake_db, monkeypatch)
+
+        resp = client.post('/api/ai/chat', json={'message': '入库 5 个测试品'})
+        assert resp.status_code == 200 and resp.get_json()['success'] is True
+
+        writes = [(s, t) for s, t in tx_log if s.lstrip().upper().startswith(('INSERT', 'UPDATE'))]
+        assert len(writes) >= 3   # products + inventory + transactions（至少）
+        assert all(t is True for _, t in writes), f'存在事务外的写入: {writes}'
+
+    def test_set_quantity_uses_atomic_delta(self, app_mod, client, fake_db, monkeypatch):
+        """回归 #3：set_quantity 必须走原子增减+流水，禁止裸读-改-写 UPDATE"""
+        reply = '好的。\n```action\n[{"action": "set_quantity", "sku": "S1", "quantity": 30}]\n```\n'
+        monkeypatch.setattr(app_mod.ai_service, 'chat', lambda msg: reply)
+        monkeypatch.setattr(app_mod.ProductModel, 'get_by_sku', make_recorder({'id': 5}))
+        state = make_stateful_inventory(fake_db, monkeypatch, initial_qty=20)
+        tx_log = track_tx(fake_db, monkeypatch)
+        patch_all_dbs(app_mod, fake_db, monkeypatch)
+
+        resp = client.post('/api/ai/chat', json={'message': '把 S1 库存调到 30'})
+        assert resp.status_code == 200 and resp.get_json()['success'] is True
+
+        inc = fake_db.find_executed('UPDATE inventory SET quantity = quantity + %s')
+        assert len(inc) == 1 and inc[0][1] == (10, 5)   # delta=30-20=10
+        assert state['qty'] == 30
+        assert not any(re.search(r'UPDATE inventory SET quantity=%s', s) for s, _ in fake_db.executed)
+
+        txn = fake_db.find_executed('INSERT INTO transactions')
+        assert len(txn) == 1
+        sql, p = txn[0]
+        # stock_in 流水：type='in' 是 SQL 字面量；参数顺序 product_id, quantity, unit_price, supplier_id, before, after, ...
+        assert "'in'" in sql
+        assert (p[0], p[1]) == (5, 10)
+        assert (p[4], p[5]) == (20, 30)   # before, after
+
+    def test_do_ai_set_quantity_rejects_negative(self, app_mod, fake_db, monkeypatch):
+        """回归 #3：目标数量为负直接拒绝，不产生任何写入"""
+        monkeypatch.setattr(app_mod.ProductModel, 'get_by_sku', make_recorder({'id': 5}))
+        monkeypatch.setattr(app_mod, 'db', fake_db)
+
+        with pytest.raises(ValueError, match='不能为负数'):
+            app_mod._do_ai_set_quantity('S1', -5)
+        assert fake_db.executed == []
+
+    def test_do_ai_set_quantity_insufficient_stock_raises(self, app_mod, fake_db, monkeypatch):
+        """回归 #3：调低库存但不足扣减 → 抛错回滚，不出现负库存"""
+        monkeypatch.setattr(app_mod.ProductModel, 'get_by_sku', make_recorder({'id': 5}))
+        fake_db.update_affected = 0   # 条件扣减未命中
+        fake_db.one_side_effect = (
+            lambda sql, params=None: {'quantity': 20} if 'SELECT quantity FROM inventory' in sql else None)
+        patch_all_dbs(app_mod, fake_db, monkeypatch)
+
+        with pytest.raises(ValueError, match='库存不足'):
+            app_mod._do_ai_set_quantity('S1', 5)   # 需减 15，但扣减未命中
+
+
+# ==========================================
+#  回归：导出端点校验 + 文件名净化/时间戳
+# ==========================================
+class TestExportValidation:
+    def test_order_export_rejects_non_list_items(self, client):
+        resp = client.post('/api/order/export', json={'items': 'nope'})
+        assert resp.status_code == 400 and 'items' in resp.get_json()['error']
+
+    def test_order_export_rejects_non_dict_entries(self, client):
+        resp = client.post('/api/order/export', json={'items': [1, 2]})
+        assert resp.status_code == 400
+
+    def test_order_export_rejects_missing_json_body(self, client):
+        resp = client.post('/api/order/export', data='plain text', content_type='text/plain')
+        assert resp.status_code == 400
+
+    def test_order_export_tolerates_bad_numbers(self, client):
+        """回归 #9：非法价格/数量按 0 计，整单不得 500"""
+        resp = client.post('/api/order/export', json={
+            'customer': '测试', 'items': [{'name': 'X', 'quantity': 'abc', 'sale_price': None}]})
+        assert resp.status_code == 200 and resp.data[:2] == b'PK'
+
+    def test_export_inventory_rejects_non_dict_entries(self, client):
+        resp = client.post('/api/order/export-inventory', json={'items': [1, 2]})
+        assert resp.status_code == 400
+
+    def test_export_inventory_tolerates_bad_price(self, client):
+        """回归 #9：非法最近进价不得让整单导出失败"""
+        resp = client.post('/api/order/export-inventory', json={
+            'items': [{'product_name': 'X', 'latest_price': 'abc'}]})
+        assert resp.status_code == 200 and resp.data[:2] == b'PK'
+
+    def test_order_export_filename_sanitized_with_timestamp(self, client):
+        """回归 #8：文件名必须净化（防路径穿越）且带秒级时间戳"""
+        resp = client.post('/api/order/export', json={
+            'customer': '../../evil name!', 'items': [{'name': 'X', 'quantity': 1, 'sale_price': 1}]})
+        assert resp.status_code == 200
+        cd = resp.headers.get('Content-Disposition', '')
+        assert '/' not in cd                       # 无路径穿越字符
+        assert re.search(r'\d{8}_\d{6}', cd)       # 秒级时间戳

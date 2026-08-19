@@ -199,16 +199,35 @@ class ProductModel:
 
     @staticmethod
     def update(prod_id, name, sku, category_id=None, supplier_id=None, unit='个', specification='',
-               description='', unit_price=0, sale_price=0):
+               description='', unit_price=None, sale_price=None):
+        """更新商品信息。
+
+        价格为 None 时不触碰现有价格：Excel / AI 智能导入路径没有价格列，
+        若默认写 0 会在重新导入时把已有商品的价格清零；只有显式传值才更新。
+        """
+        sets = ["name=%s", "sku=%s", "category_id=%s", "supplier_id=%s", "unit=%s",
+                "specification=%s", "description=%s"]
+        params = [name, sku, category_id, supplier_id, unit, specification, description]
+        if unit_price is not None:
+            sets.append("unit_price=%s")
+            params.append(unit_price)
+        if sale_price is not None:
+            sets.append("sale_price=%s")
+            params.append(sale_price)
         db.execute(
-            """UPDATE products SET name=%s, sku=%s, category_id=%s, supplier_id=%s, unit=%s,
-               specification=%s, unit_price=%s, sale_price=%s, description=%s WHERE id=%s""",
-            (name, sku, category_id, supplier_id, unit, specification, unit_price, sale_price, description, prod_id)
+            f"UPDATE products SET {', '.join(sets)} WHERE id=%s",
+            (*params, prod_id)
         )
 
     @staticmethod
     def delete(prod_id):
+        """删除商品及其库存记录（必须在事务内调用）。
+
+        显式删 inventory 行，不依赖外键 CASCADE：即使生产库缺少该约束，
+        被删商品的库存也不会变成孤儿、继续虚增仪表盘总数量。
+        """
         db.execute("DELETE FROM products WHERE id=%s", (prod_id,))
+        db.execute("DELETE FROM inventory WHERE product_id=%s", (prod_id,))
 
     @staticmethod
     def search(keyword):
@@ -458,6 +477,11 @@ class SupplierModel:
         return db.query_one("SELECT * FROM suppliers WHERE id=%s", (sid,))
 
     @staticmethod
+    def get_by_name(name):
+        """按名称精确查找（导入去重用）"""
+        return db.query_one("SELECT * FROM suppliers WHERE name=%s", (name,))
+
+    @staticmethod
     def create(name, contact='', phone='', email='', address='', notes=''):
         _, lid = db.execute(
             "INSERT INTO suppliers (name, contact_person, phone, email, address, notes) VALUES (%s,%s,%s,%s,%s,%s)",
@@ -488,6 +512,11 @@ class CustomerModel:
     @staticmethod
     def get_by_id(cid):
         return db.query_one("SELECT * FROM customers WHERE id=%s", (cid,))
+
+    @staticmethod
+    def get_by_name(name):
+        """按名称精确查找（导入去重 / 出库单客户复用）"""
+        return db.query_one("SELECT * FROM customers WHERE name=%s", (name,))
 
     @staticmethod
     def create(name, contact='', phone='', email='', address='', notes=''):

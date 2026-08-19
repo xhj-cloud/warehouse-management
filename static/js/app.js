@@ -1125,7 +1125,11 @@ function downloadOrder() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(data),
     }).then(function(resp) {
-        if (!resp.ok) throw new Error('导出失败');
+        if (!resp.ok) {
+            // 服务端返回 JSON 错误时展示具体原因，而不是笼统的「导出失败」
+            return resp.json().catch(function() { return null; })
+                .then(function(j) { throw new Error((j && j.error) || '导出失败'); });
+        }
         return resp.blob();
     }).then(function(blob) {
         var a = document.createElement('a');
@@ -1218,7 +1222,10 @@ function exportInventory() {
         });
     }).then(function(r) {
         if (!r) return;
-        if (!r.ok) throw new Error('HTTP ' + r.status);
+        if (!r.ok) {
+            return r.json().catch(function() { return null; })
+                .then(function(j) { throw new Error((j && j.error) || ('HTTP ' + r.status)); });
+        }
         return r.blob();
     }).then(function(b) {
         if (!b) return;

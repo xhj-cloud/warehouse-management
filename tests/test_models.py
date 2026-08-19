@@ -256,3 +256,77 @@ class TestDecimalPrecision:
         """回归：DECIMAL 列保持 Decimal 类型，连接配置里不再有全局 float 转换"""
         d = models_mod.Database()
         assert 'conv' not in d.config
+
+
+# ==========================================
+#  ProductModel.update：价格缺省不清零（导入路径回归）
+# ==========================================
+class TestProductUpdatePrices:
+    def test_update_without_prices_omits_price_columns(self, monkeypatch):
+        """回归：不传价格时 SQL 不得包含 unit_price/sale_price，避免重新导入把价格清零"""
+        db = FakeDB()
+        monkeypatch.setattr(models_mod, 'db', db)
+
+        models_mod.ProductModel.update(9, '螺丝 M6', 'S1')
+
+        sql, params = db.executed[0]
+        assert 'UPDATE products SET' in sql
+        assert 'unit_price' not in sql and 'sale_price' not in sql
+        # 参数顺序：name, sku, category_id, supplier_id, unit, specification, description, prod_id
+        assert params == ('螺丝 M6', 'S1', None, None, '个', '', '', 9)
+
+    def test_update_with_explicit_prices_includes_them(self, monkeypatch):
+        db = FakeDB()
+        monkeypatch.setattr(models_mod, 'db', db)
+
+        models_mod.ProductModel.update(9, '螺丝 M6', 'S1', unit_price=5.5, sale_price=9.9)
+
+        sql, params = db.executed[0]
+        assert 'unit_price=%s' in sql and 'sale_price=%s' in sql
+        assert 5.5 in params and 9.9 in params
+        assert params[-1] == 9
+
+
+# ==========================================
+#  ProductModel.delete：连带清理库存行（孤儿库存回归）
+# ==========================================
+class TestProductDeleteCleansInventory:
+    def test_delete_removes_product_and_inventory_row(self, monkeypatch):
+        """回归：删商品必须同删 inventory 行，否则仪表盘总数量永久虚增"""
+        db = FakeDB()
+        monkeypatch.setattr(models_mod, 'db', db)
+
+        models_mod.ProductModel.delete(7)
+
+        assert len(db.executed) == 2
+        prod_sql, prod_params = db.executed[0]
+        inv_sql, inv_params = db.executed[1]
+        assert 'DELETE FROM products' in prod_sql and prod_params == (7,)
+        assert 'DELETE FROM inventory WHERE product_id=%s' in inv_sql and inv_params == (7,)
+
+
+# ==========================================
+#  SupplierModel / CustomerModel.get_by_name（导入去重）
+# ==========================================
+class TestGetByName:
+    def test_supplier_get_by_name(self, monkeypatch):
+        db = FakeDB()
+        db.one_side_effect = lambda sql, params=None: {'id': 3, 'name': '华为'}
+        monkeypatch.setattr(models_mod, 'db', db)
+
+        row = models_mod.SupplierModel.get_by_name('华为')
+
+        assert row == {'id': 3, 'name': '华为'}
+        sql, params = db.queries[0]
+        assert 'FROM suppliers WHERE name=%s' in sql and params == ('华为',)
+
+    def test_customer_get_by_name(self, monkeypatch):
+        db = FakeDB()
+        db.one_side_effect = lambda sql, params=None: None
+        monkeypatch.setattr(models_mod, 'db', db)
+
+        row = models_mod.CustomerModel.get_by_name('中建')
+
+        assert row is None
+        sql, params = db.queries[0]
+        assert 'FROM customers WHERE name=%s' in sql and params == ('中建',)
