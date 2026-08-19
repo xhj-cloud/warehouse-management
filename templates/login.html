@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>登录 - 仓库管理系统</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+    <style>
+        body {
+            margin: 0;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+        }
+        .login-card {
+            width: 380px;
+            max-width: 92vw;
+            background: #fff;
+            border-radius: 16px;
+            padding: 40px 36px 32px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.35);
+        }
+        .login-card h1 {
+            margin: 0 0 4px;
+            font-size: 24px;
+            color: #0f172a;
+            text-align: center;
+        }
+        .login-card .sub {
+            text-align: center;
+            color: #94a3b8;
+            font-size: 13px;
+            margin: 0 0 28px;
+        }
+        .login-card .form-group { margin-bottom: 18px; }
+        .login-card label {
+            display: block;
+            font-size: 13px;
+            color: #64748b;
+            margin-bottom: 6px;
+        }
+        .login-card .form-input {
+            width: 100%;
+            box-sizing: border-box;
+            padding: 10px 12px;
+            border: 1px solid #e2e8f0;
+            border-radius: 8px;
+            font-size: 15px;
+            outline: none;
+            transition: border-color .2s, box-shadow .2s;
+        }
+        .login-card .form-input:focus {
+            border-color: var(--primary);
+            box-shadow: 0 0 0 3px rgba(37,99,235,0.12);
+        }
+        .login-card .btn-primary {
+            width: 100%;
+            padding: 11px;
+            border: none;
+            border-radius: 8px;
+            font-size: 15px;
+            font-weight: 600;
+            color: #fff;
+            background: var(--primary);
+            cursor: pointer;
+            transition: background .2s;
+            margin-top: 4px;
+        }
+        .login-card .btn-primary:hover { background: var(--primary-dark); }
+        .login-card .btn-primary:disabled { opacity: .6; cursor: not-allowed; }
+        #login-error {
+            color: #ef4444;
+            font-size: 13px;
+            text-align: center;
+            min-height: 18px;
+            margin-bottom: 10px;
+        }
+        .login-foot {
+            text-align: center;
+            color: #cbd5e1;
+            font-size: 12px;
+            margin-top: 26px;
+        }
+        .login-foot span { opacity: .85; }
+    </style>
+</head>
+<body>
+    <div class="login-card">
+        <h1>📦 仓库管理系统</h1>
+        <p class="sub">Inventory Management System</p>
+        <div id="login-error"></div>
+        <form id="login-form" autocomplete="on">
+            <div class="form-group">
+                <label for="login-username">用户名</label>
+                <input type="text" class="form-input" id="login-username" placeholder="请输入用户名"
+                       autocomplete="username" required>
+            </div>
+            <div class="form-group">
+                <label for="login-password">密码</label>
+                <input type="password" class="form-input" id="login-password" placeholder="请输入密码"
+                       autocomplete="current-password" required>
+            </div>
+            <button type="submit" class="btn-primary" id="login-btn">登 录</button>
+        </form>
+        <div class="login-foot"><span>登录后保持 7 天有效，无需重复登录</span></div>
+    </div>
+
+    <script>
+        const form = document.getElementById('login-form');
+        const btn = document.getElementById('login-btn');
+        const errEl = document.getElementById('login-error');
+
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const username = document.getElementById('login-username').value.trim();
+            const password = document.getElementById('login-password').value;
+            if (!username || !password) {
+                errEl.textContent = '请输入用户名和密码';
+                return;
+            }
+            btn.disabled = true;
+            btn.textContent = '登录中...';
+            errEl.textContent = '';
+            try {
+                const resp = await fetch('/api/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username, password }),
+                });
+                const r = await resp.json();
+                if (r.success) {
+                    window.location.href = '/';
+                } else {
+                    errEl.textContent = r.error || '登录失败';
+                    btn.disabled = false;
+                    btn.textContent = '登 录';
+                }
+            } catch (err) {
+                errEl.textContent = '网络错误，请重试';
+                btn.disabled = false;
+                btn.textContent = '登 录';
+            }
+        });
+
+        // 回车直接提交（表单默认行为已处理）；聚焦用户名
+        document.getElementById('login-username').focus();
+    </script>
+</body>
+</html>

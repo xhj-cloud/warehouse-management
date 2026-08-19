@@ -12,10 +12,13 @@ import traceback
 import logging
 import pymysql
 import pandas as pd
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 import base64
 import hmac
-from flask import Flask, request, jsonify, render_template, send_from_directory, send_file, make_response
+from flask import (
+    Flask, request, jsonify, render_template, send_from_directory, send_file,
+    make_response, session, redirect, url_for,
+)
 from functools import wraps
 from flask.json.provider import DefaultJSONProvider
 
@@ -58,84 +61,110 @@ app = Flask(__name__)
 app.json = CustomJSONProvider(app)
 app.secret_key = SECRET_KEY
 app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH
+# 登录态保持 7 天（持久 cookie）：刷新页面/重开浏览器不再需要重新登录
+app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=7)
+app.config['SESSION_COOKIE_HTTPONLY'] = True
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
 
 # 确保上传目录存在
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 
 # ==========================================
-#  认证：HTTP Basic（数据库用户表 + 环境变量超级管理员兜底）
+#  认证：Session 登录（数据库用户表 + 环境变量超级管理员兜底）
 # ==========================================
 # users 表为空时引导默认 admin/admin123（首次部署自动创建，不依赖硬编码哈希进 SQL）
 seed_admin_if_empty()
 
 # 认证始终启用（除非显式 DISABLE_AUTH）。
-# - 优先校验 users 表（支持多账户 + 角色）
-# - 保留环境变量 AUTH_USER/AUTH_PASSWORD 作为超级管理员兜底（不受用户表影响）
+# - 登录页 /login 提交用户名密码 → 校验 users 表 → 写入 session（7 天有效）
+# - 环境变量 AUTH_USER/AUTH_PASSWORD 作为超级管理员兜底（不受用户表影响）
 _AUTH_ENABLED = not AUTH_DISABLED
 
 if _AUTH_ENABLED:
-    print("  认证已启用：/api/* 与 /uploads/* 需 Basic Auth（数据库用户表；可用账户管理页创建）")
+    print("  认证已启用：访问需登录（可用账户管理页创建账户）")
 else:
     print("  警告：已通过 DISABLE_AUTH 显式关闭认证（仅限本地联调，请勿用于线上/内网）")
 
 
-def _current_username():
-    """返回当前请求已认证用户名；未认证返回 None。"""
-    auth = request.authorization
-    return auth.username if (auth and auth.username is not None) else None
-
-
-def _basic_auth_required():
-    """校验 Authorization: Basic ...（数据库用户表优先，环境变量管理员兜底）。
-
-    Basic Auth 的密码校验由 werkzeug check_password_hash 完成（非明文、抗时序）。
-    """
-    auth = request.authorization
-    if not (auth and auth.username is not None):
-        return False
-    username = str(auth.username)
-
+def _validate_credentials(username, password):
+    """校验用户名+密码：users 表优先，环境变量超级管理员兜底。成功返回 (ok, role)。"""
     # 1) 数据库用户表校验
-    if UserModel.authenticate(username, auth.password or ''):
-        return True
-
+    user = UserModel.authenticate(username, password)
+    if user:
+        return True, user.get('role') or 'user'
     # 2) 环境变量超级管理员兜底（常量时间比较）
-    if AUTH_PASSWORD and hmac.compare_digest(username, str(AUTH_USER)) \
-            and hmac.compare_digest(auth.password or '', str(AUTH_PASSWORD)):
-        return True
+    if AUTH_PASSWORD and hmac.compare_digest(str(username), str(AUTH_USER)) \
+            and hmac.compare_digest(password or '', str(AUTH_PASSWORD)):
+        return True, 'admin'
+    return False, None
 
-    return False
+
+def _current_username():
+    """返回当前已登录用户名；未登录返回 None。"""
+    return session.get('username')
 
 
 def _is_admin():
-    """当前请求用户是否管理员（数据库 role=admin 或环境变量超级管理员）。"""
-    auth = request.authorization
-    if not (auth and auth.username is not None):
-        return False
-    username = str(auth.username)
-    if not _basic_auth_required():
-        return False
-    # 环境变量超级管理员
-    if AUTH_PASSWORD and hmac.compare_digest(username, str(AUTH_USER)) \
-            and hmac.compare_digest(auth.password or '', str(AUTH_PASSWORD)):
+    """当前登录用户是否管理员（登录时写入 session 的 role=admin）。"""
+    return session.get('role') == 'admin'
+
+
+def _require_login():
+    """判断当前请求是否已登录（未启用认证时视为已登录）。"""
+    if not _AUTH_ENABLED:
         return True
-    user = UserModel.get_by_username(username)
-    return bool(user and user.get('role') == 'admin')
+    return bool(session.get('username'))
+
+
+@app.route('/login')
+def login_page():
+    """登录页（GET）。"""
+    if _require_login():
+        return redirect(url_for('index'))
+    return render_template('login.html')
+
+
+@app.route('/api/login', methods=['POST'])
+def api_login():
+    """登录接口：校验用户名密码，写入 session（7 天有效）。"""
+    try:
+        data = request.json or {}
+        username = _clean_cell(data.get('username'))
+        password = data.get('password') or ''
+        if not username or not password:
+            return jsonify({'success': False, 'error': '请输入用户名和密码'}), 400
+        ok, role = _validate_credentials(username, password)
+        if not ok:
+            return jsonify({'success': False, 'error': '用户名或密码错误'}), 401
+        session.permanent = True          # 7 天持久 cookie，刷新/重开页面保持登录
+        session['username'] = username
+        session['role'] = role
+        return jsonify({'success': True, 'data': {'username': username, 'role': role}})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/logout', methods=['POST'])
+def api_logout():
+    """退出登录：清空 session。"""
+    session.clear()
+    return jsonify({'success': True})
 
 
 @app.before_request
 def _authenticate():
-    """对所有 /api/* 与 /uploads/* 请求强制 Basic Auth（首页与静态资源除外）。"""
+    """所有页面与 /api/*、/uploads/* 均需登录（登录页与静态资源除外）。"""
     path = request.path
-    if not (_AUTH_ENABLED and (path.startswith('/api/') or path.startswith('/uploads/'))):
+    # 登录页 / 登录接口 / 静态资源 / favicon 公开（登录接口必须在白名单，否则无法登录）
+    if path in ('/login', '/api/login') or path.startswith('/static/') or path == '/favicon.ico':
         return None
-    if _basic_auth_required():
+    if _require_login():
         return None
-    resp = make_response(
-        jsonify({'success': False, 'error': '需要认证'}), 401)
-    resp.headers['WWW-Authenticate'] = 'Basic realm="warehouse-management"'
-    return resp
+    # 未登录：API 返回 401 JSON，页面重定向到登录页
+    if path.startswith('/api/') or path.startswith('/uploads/'):
+        return jsonify({'success': False, 'error': '未登录', 'code': 'AUTH_REQUIRED'}), 401
+    return redirect(url_for('login_page'))
 
 
 def allowed_file(filename):
@@ -268,10 +297,11 @@ def _cleanup_old_order_files(keep_days=7):
 def api_auth_me():
     """返回当前登录用户信息（供前端显示当前账户与是否为管理员）。"""
     username = _current_username()
-    if not username or not _basic_auth_required():
-        return jsonify({'success': False, 'error': '未认证'}), 401
+    if not _require_login():
+        return jsonify({'success': False, 'error': '未登录', 'code': 'AUTH_REQUIRED'}), 401
     return jsonify({'success': True, 'data': {
         'username': username,
+        'role': session.get('role'),
         'is_admin': _is_admin(),
     }})
 

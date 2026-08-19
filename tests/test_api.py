@@ -1505,3 +1505,39 @@ class TestUserManagement:
         assert resp.status_code == 400
         assert '至少 6 位' in resp.get_json()['error']
 
+
+
+# ==========================================
+#  Session 登录（登录验证逻辑）
+# ==========================================
+class TestSessionLogin:
+    def test_validate_credentials_db_user(self, app_mod, monkeypatch):
+        """数据库用户表校验：正确用户+密码 → (True, role)"""
+        monkeypatch.setattr(app_mod.UserModel, 'authenticate',
+                            lambda u, p: {'id': 1, 'username': u, 'role': 'user'})
+        ok, role = app_mod._validate_credentials('bob', 'correct')
+        assert ok is True and role == 'user'
+
+    def test_validate_credentials_env_admin_fallback(self, app_mod, monkeypatch):
+        """环境变量超级管理员兜底：users 表查不到时仍可登录 admin"""
+        monkeypatch.setattr(app_mod.UserModel, 'authenticate', lambda u, p: None)
+        monkeypatch.setattr(app_mod, 'AUTH_USER', 'admin')
+        monkeypatch.setattr(app_mod, 'AUTH_PASSWORD', 'admin123')
+        ok, role = app_mod._validate_credentials('admin', 'admin123')
+        assert ok is True and role == 'admin'
+
+    def test_validate_credentials_wrong_password(self, app_mod, monkeypatch):
+        """错误密码（用户表+环境变量都不匹配）→ (False, None)"""
+        monkeypatch.setattr(app_mod.UserModel, 'authenticate', lambda u, p: None)
+        monkeypatch.setattr(app_mod, 'AUTH_USER', 'admin')
+        monkeypatch.setattr(app_mod, 'AUTH_PASSWORD', 'admin123')
+        ok, role = app_mod._validate_credentials('admin', 'wrong')
+        assert ok is False and role is None
+
+    def test_login_route_rejects_bad_credentials(self, app_mod, client, monkeypatch):
+        """POST /api/login 错误凭据 → 401"""
+        monkeypatch.setattr(app_mod.UserModel, 'authenticate', lambda u, p: None)
+        monkeypatch.setattr(app_mod, 'AUTH_PASSWORD', '')
+        resp = client.post('/api/login', json={'username': 'x', 'password': 'bad'})
+        assert resp.status_code == 401
+        assert '用户名或密码错误' in resp.get_json()['error']

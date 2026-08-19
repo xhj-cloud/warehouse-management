@@ -42,6 +42,12 @@ async function fetchAPI(url, options = {}) {
             try {
                 const body = await resp.json();
                 if (body && body.error) detail = body.error;
+                // 会话过期/未登录：跳转登录页（避免死循环，登录接口本身不跳）
+                if (resp.status === 401 && body && body.code === 'AUTH_REQUIRED'
+                        && !url.includes('/api/login')) {
+                    window.location.href = '/login';
+                    return { success: false, error: '未登录' };
+                }
             } catch (_) { /* 非 JSON 响应（如 debug 页面） */ }
             return { success: false, error: detail };
         }
@@ -1360,20 +1366,24 @@ async function uploadCustomerExcel(file) {
 // ==========================================
 // 页面加载时探测当前账户：管理员才显示"账户管理"入口
 async function loadAuthInfo() {
-    // 首登时 Basic Auth 凭据可能尚未被浏览器缓存（首个 /api 请求尚未完成 401→凭据 往返），
-    // 这里最多重试 3 次，间隔 400ms，确保能拿到真实角色。
-    for (let attempt = 0; attempt < 3; attempt++) {
-        const r = await fetchAPI(`${API}/auth/me`);
-        if (r.success && r.data) {
-            const info = r.data;
-            const navAccounts = $('#nav-accounts');
-            if (navAccounts) navAccounts.style.display = info.is_admin ? '' : 'none';
-            const el = $('#accounts-current-user');
-            if (el) el.textContent = '当前登录：' + info.username + (info.is_admin ? '（管理员）' : '（普通用户）');
-            return;
-        }
-        await new Promise(res => setTimeout(res, 400));
+    // Session 登录：页面能加载就说明已登录（未登录会被 before_request 重定向到 /login），
+    // 这里只负责拿到角色并显示"账户管理"入口与当前用户。
+    const r = await fetchAPI(`${API}/auth/me`);
+    if (r.success && r.data) {
+        const info = r.data;
+        const navAccounts = $('#nav-accounts');
+        if (navAccounts) navAccounts.style.display = info.is_admin ? '' : 'none';
+        const el = $('#accounts-current-user');
+        if (el) el.textContent = '当前登录：' + info.username + (info.is_admin ? '（管理员）' : '（普通用户）');
+        // 顶部栏显示当前用户
+        const topUser = $('#topbar-user');
+        if (topUser) topUser.textContent = info.username + (info.is_admin ? '（管理员）' : '');
     }
+}
+
+async function logoutUser() {
+    await fetchAPI(`${API}/logout`, { method: 'POST' });
+    window.location.href = '/login';
 }
 
 async function loadAccounts() {
