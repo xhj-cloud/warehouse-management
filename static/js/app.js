@@ -790,6 +790,66 @@ function renderChatReply(text) {
         '<a href="$2" target="_blank" rel="noopener">$1</a>');
 }
 
+// 流式拉取 AI 回复（SSE）。onToken(content) 收到增量，onDone(full, log) 结尾触发，onError(err) 出错。
+function streamAIChat(message, onToken, onDone, onError) {
+    const controller = new AbortController();
+    // 流式请求可能有较长的空闲间隔，给足 10 分钟
+    const timer = setTimeout(() => controller.abort(), 600000);
+    fetch(`${API}/ai/chat/stream`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message }),
+        signal: controller.signal,
+    }).then(async (resp) => {
+        clearTimeout(timer);
+        if (resp.status === 401) {
+            // 会话过期/未登录 → 跳登录页
+            try { const b = await resp.json(); if (b && b.code === 'AUTH_REQUIRED') { window.location.href = '/login'; return; } } catch (_) {}
+        }
+        if (!resp.ok || !resp.body) {
+            let detail = `服务器错误 (HTTP ${resp.status})`;
+            try { const b = await resp.json(); if (b && b.error) detail = b.error; } catch (_) {}
+            onError(detail);
+            return;
+        }
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder('utf-8');
+        let buf = '';
+        let lastError = null;
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buf += decoder.decode(value, { stream: true });
+            // 按空行切分 SSE 事件（data: {...}\n\n）
+            let idx;
+            while ((idx = buf.indexOf('\n\n')) !== -1) {
+                const frame = buf.slice(0, idx);
+                buf = buf.slice(idx + 2);
+                for (const line of frame.split('\n')) {
+                    if (!line.startsWith('data:')) continue;
+                    const payload = line.slice(5).trim();
+                    if (payload === '[DONE]') continue;
+                    let ev;
+                    try { ev = JSON.parse(payload); } catch (_) { continue; }
+                    if (ev.type === 'token') onToken(ev.content || '');
+                    else if (ev.type === 'log') { /* 不单独展示，done 里已含执行日志 */ }
+                    else if (ev.type === 'done') { onDone(ev.data || '', ev.log || null); return; }
+                    else if (ev.type === 'error') { lastError = ev.error || 'AI 分析出错'; }
+                }
+                if (lastError) break;
+            }
+            if (lastError) break;
+        }
+        if (lastError) { onError(lastError); return; }
+        // 流未明确 end 事件就结束 → 兜底
+        onDone('', null);
+    }).catch((err) => {
+        clearTimeout(timer);
+        if (err.name === 'AbortError') onError('请求超时，请稍后重试');
+        else onError(`网络错误: ${err.message}`);
+    });
+}
+
 async function sendAIChat() {
     const input = $('#ai-chat-input');
     const message = input.value.trim();
@@ -811,18 +871,26 @@ async function sendAIChat() {
     messagesContainer.appendChild(aiPlaceholder);
     messagesContainer.scrollTop = messagesContainer.scrollHeight;
 
-    const result = await fetchAPI(`${API}/ai/chat`, {
-        method: 'POST',
-        body: JSON.stringify({ message }),
-    });
-
-    if (result.success) {
-        // 用安全渲染替换纯文本：出库单下载链接 [点击下载出库单](/uploads/...) 可点击
-        aiPlaceholder.innerHTML = renderChatReply(result.data);
-    } else {
-        aiPlaceholder.textContent = '抱歉，分析出错: ' + result.error;
-    }
-    messagesContainer.scrollTop = messagesContainer.scrollHeight;
+    streamAIChat(
+        message,
+        // 逐步渲染：增量文本拼接到完整回复里，用安全渲染（转义 + 站内链接）更新气泡
+        (chunk) => {
+            aiPlaceholder.dataset.acc = (aiPlaceholder.dataset.acc || '') + chunk;
+            aiPlaceholder.innerHTML = renderChatReply(aiPlaceholder.dataset.acc) + (aiPlaceholder.dataset.acc.endsWith(' ') || aiPlaceholder.dataset.acc.endsWith('\n') ? '' : '');
+            messagesContainer.scrollTop = messagesContainer.scrollHeight;
+        },
+        // 流结束：用完整回复做最终渲染（含下载链接），并清空缓存
+        (full) => {
+            aiPlaceholder.innerHTML = renderChatReply(full);
+            delete aiPlaceholder.dataset.acc;
+            messagesContainer.scrollTop = messagesContainer.scrollHeight;
+        },
+        // 出错
+        (err) => {
+            aiPlaceholder.textContent = '抱歉，分析出错: ' + err;
+            messagesContainer.scrollTop = messagesContainer.scrollHeight;
+        }
+    );
 }
 
 $('#ai-chat-input')?.addEventListener('keydown', (e) => {

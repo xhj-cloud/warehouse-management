@@ -1,6 +1,6 @@
 """
 仓库管理系统 - LM Studio AI 分析服务
-通过 OpenAI 兼容 API 调用本地部署的 qwen3.6-35b-a3b 模型
+通过 OpenAI 兼容 API 调用本地部署的 Qwen3.8-27B 模型（支持流式 SSE 输出）
 """
 
 import json
@@ -65,6 +65,123 @@ class AIService:
             raise AIServiceError(f"LM Studio 返回 HTTP {code} 错误，请检查模型状态。") from None
         except Exception as e:
             raise AIServiceError(f"AI 分析出错: {str(e)}") from None
+
+    def _stream_completion(self, messages):
+        """低层流式调用：逐块 yield 内容增量字符串。
+
+        连接失败/超时/HTTP 错误抛 AIServiceError（与 _call 一致，便于上层统一处理）。
+        """
+        url = f"{self.base_url}/chat/completions"
+        payload = {
+            'model': self.model,
+            'messages': messages,
+            'temperature': self.temperature,
+            'max_tokens': self.max_tokens,
+            'stream': True,   # 关键：启用 SSE 流式
+        }
+        try:
+            with requests.post(url, json=payload, timeout=self.timeout, stream=True) as resp:
+                resp.raise_for_status()
+                for raw_line in resp.iter_lines(decode_unicode=True):
+                    if not raw_line:
+                        continue
+                    # 只处理 "data: ..." 前缀的行
+                    if raw_line.startswith('data:'):
+                        data_str = raw_line[len('data:'):].strip()
+                    else:
+                        continue
+                    if data_str == '[DONE]':
+                        break
+                    try:
+                        chunk = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+                    choices = chunk.get('choices') or []
+                    if not choices:
+                        continue
+                    delta = choices[0].get('delta', {}) or {}
+                    content = delta.get('content')
+                    if content:
+                        yield content
+        except requests.exceptions.Timeout:
+            raise AIServiceError("AI 分析服务超时，请稍后重试。") from None
+        except requests.exceptions.ConnectionError:
+            raise AIServiceError(
+                f"无法连接到 LM Studio 服务，请确认服务是否已启动 ({self.base_url})。") from None
+        except requests.exceptions.HTTPError as e:
+            code = e.response.status_code if e.response is not None else '未知'
+            raise AIServiceError(f"LM Studio 返回 HTTP {code} 错误，请检查模型状态。") from None
+        except GeneratorExit:
+            # 客户端断开：正常结束生成器，不全抛 AIServiceError
+            return
+        except Exception as e:
+            raise AIServiceError(f"AI 分析出错: {str(e)}") from None
+
+    def chat_stream(self, user_message):
+        """流式对话：逐段 yield 回复正文，可在流式展示的同时把 action 指令推迟到 stream 末尾解析。
+
+        生成器产出两种事件字典：
+            {'type': 'token', 'content': '...'}  回复正文的增量片段（收到即推给前端）
+            {'type': 'done',  'full': '...', 'reply': '...', 'actions': [...]}
+                全部 token 结束；reply=正文(去掉 action 块)，actions=解析出的指令(无则 None)
+
+        reply 以外出现的 '```action'/'```json' 代码块需在最后用 parse_actions 从完整输出中剥离，
+        因此流式过程中遇到 action 围栏后停止继续推送，把剩余部分积攒下来最后统一解析。
+        """
+        context = self.build_inventory_context()
+        system_prompt = f"""你是一个专业的仓库库存管理助手，可以管理库存、供应商和客户。当前数据：
+{context}
+
+操作指令格式（放在回复末尾）：
+```action
+[
+  {{"action":"stock_in","sku":"SKU编码","quantity":数量,"unit":"单位","category":"分类名","supplier":"供应商名"}},
+  {{"action":"stock_out","sku":"SKU编码","quantity":数量}},
+  {{"action":"set_quantity","sku":"SKU编码","quantity":数量}},
+  {{"action":"smart_import","text":"采购描述"}},
+  {{"action":"add_supplier","name":"供应商名","contact":"联系人","phone":"电话"}},
+  {{"action":"add_customer","name":"客户名","contact":"联系人","phone":"电话"}},
+  {{"action":"create_order","customer":"客户名","operator":"经办人","keeper":"库管","warehouse":"仓库编号",
+    "items":[{{"sku":"SKU","quantity":数量,"price":单价}}]}}
+]
+```
+
+规则：
+- 入库/买了/进货 → stock_in，必须带上 unit、category、supplier
+- 出库/用了/消耗 → stock_out
+- 改成/调整为 → set_quantity
+- 新增供应商/客户 → add_supplier / add_customer
+- 创建出库单 → create_order，需要客户、经办人、商品清单(SKU+数量+单价)
+- 纯提问不要输出 action
+- 先自然回复，再放指令"""
+        messages = [
+            {'role': 'system', 'content': system_prompt},
+            {'role': 'user', 'content': user_message},
+        ]
+        full = ''
+        yielded = 0          # full 中已经推送给前端的长度（避免围栏触发时重复推送）
+        in_action = False
+        for delta in self._stream_completion(messages):
+            full += delta
+            if not in_action:
+                # 一旦出现 action 围栏，说明正文到此为止，后面全是指令 JSON
+                if '```action' in full or '```json' in full:
+                    in_action = True
+                    cut = min(p for p in (
+                        full.find('```action'),
+                        full.find('```json'),
+                    ) if p != -1)
+                    if cut > yielded:   # 只推围栏前尚未推过的部分
+                        yield {'type': 'token', 'content': full[yielded:cut]}
+                        yielded = cut
+                else:
+                    yield {'type': 'token', 'content': delta}
+                    yielded = len(full)
+        # 停止流式后统一用 parse_actions 从完整输出剥离 action 块
+        actions, reply = self.parse_actions(full)
+        if not actions:
+            reply = full
+        yield {'type': 'done', 'full': full, 'reply': reply, 'actions': actions}
 
     def build_inventory_context(self):
         """构建库存上下文数据"""

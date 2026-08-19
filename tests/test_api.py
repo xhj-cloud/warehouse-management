@@ -662,6 +662,57 @@ class TestAI:
 
 
 # ==========================================
+#  /api/ai/chat/stream：流式 SSE 输出
+# ==========================================
+class TestAIStream:
+    def _patch_stream(self, app_mod, monkeypatch, events):
+        """把 ai_service.chat_stream 替换为产出给定事件的生成器"""
+        def fake_stream(message):
+            for ev in events:
+                yield ev
+        monkeypatch.setattr(app_mod.ai_service, 'chat_stream', fake_stream)
+        # 指令执行（_execute_ai_actions）若无指令则不触碰模型；此处兜底 mock 掉模型写方法
+        monkeypatch.setattr(app_mod.SupplierModel, 'get_by_name', lambda n: None)
+        monkeypatch.setattr(app_mod.SupplierModel, 'create', lambda *a, **k: None)
+        monkeypatch.setattr(app_mod.CustomerModel, 'get_by_name', lambda n: None)
+        monkeypatch.setattr(app_mod.CustomerModel, 'create', lambda *a, **k: None)
+
+    def test_streams_tokens_then_done(self, app_mod, client, monkeypatch):
+        self._patch_stream(app_mod, monkeypatch, [
+            {'type': 'token', 'content': '你好'},
+            {'type': 'token', 'content': '世界'},
+            {'type': 'done', 'full': '你好世界', 'reply': '你好世界', 'actions': None},
+        ])
+        resp = client.post('/api/ai/chat/stream', json={'message': 'hi'})
+        assert resp.status_code == 200
+        assert resp.headers['Content-Type'].startswith('text/event-stream')
+
+        body = resp.get_data(as_text=True)
+        assert 'data: {"type": "token", "content": "你好"}' in body
+        assert 'data: {"type": "token", "content": "世界"}' in body
+        # done 事件携带最终 reply；无 action 时不应有 log 事件
+        assert '"type": "done"' in body
+        assert '"你好世界"' in body
+        assert '"type": "log"' not in body
+
+    def test_stream_appends_execution_log_for_actions(self, app_mod, client, monkeypatch):
+        self._patch_stream(app_mod, monkeypatch, [
+            {'type': 'done', 'full': '好的', 'reply': '好的',
+             'actions': [{'action': 'add_supplier', 'name': '华为'}]},
+        ])
+        resp = client.post('/api/ai/chat/stream', json={'message': '新增供应商'})
+        body = resp.get_data(as_text=True)
+        # 有 action → 产生 log 事件，done 回复里含执行日志
+        assert '"type": "log"' in body
+        assert '新增供应商: 华为' in body
+
+    def test_missing_message_returns_400(self, client):
+        resp = client.post('/api/ai/chat/stream', json={})
+        assert resp.status_code == 400
+        assert resp.get_json()['error'] == '请输入问题'
+
+
+# ==========================================
 #  回归：删除商品连带清理库存行（孤儿库存）
 # ==========================================
 class TestProductDeleteAPI:

@@ -219,3 +219,56 @@ class TestHealthCheck:
         monkeypatch.setattr(ai_mod.requests, 'get', boom)
         ok, msg = svc.health_check()
         assert ok is False and '无法连接' in msg
+
+
+# ==========================================
+#  chat_stream：流式生成（SSE token / done）
+# ==========================================
+class TestChatStream:
+    def _make_stream_svc(self, svc, monkeypatch, chunks):
+        """用给定 chunk 序列构造可流式调度 + 空上下文的 svc"""
+        monkeypatch.setattr(models_mod.InventoryModel, 'get_all', lambda: [])
+        monkeypatch.setattr(models_mod.StatsModel, 'get_dashboard', lambda: {
+            'total_products': 1, 'total_categories': 1, 'total_quantity': 10, 'low_stock_count': 0})
+        monkeypatch.setattr(models_mod.InventoryModel, 'get_low_stock', lambda: [])
+        monkeypatch.setattr(models_mod.TransactionModel, 'get_all', lambda limit=30: [])
+        monkeypatch.setattr(models_mod.SupplierModel, 'get_all', lambda: [])
+        monkeypatch.setattr(models_mod.CustomerModel, 'get_all', lambda: [])
+
+        def fake_stream(self, messages):
+            for c in chunks:
+                yield c
+
+        monkeypatch.setattr(ai_mod.AIService, '_stream_completion', fake_stream)
+
+    def test_streams_plain_reply_without_action(self, svc, monkeypatch):
+        self._make_stream_svc(svc, monkeypatch, ['你好', '，', '我是助手'])
+        events = [e for e in svc.chat_stream('hi')]
+        tokens = ''.join(e['content'] for e in events if e['type'] == 'token')
+        done = [e for e in events if e['type'] == 'done'][0]
+        assert tokens == '你好，我是助手'
+        assert done['reply'] == '你好，我是助手'
+        assert done['actions'] is None
+
+    def test_streams_reply_and_splits_at_action_fence(self, svc, monkeypatch):
+        chunks = ['已为您入库。\n', '```action\n',
+                  '[{"action": "stock_in", "sku": "A1", "quantity": 5}]\n', '```']
+        self._make_stream_svc(svc, monkeypatch, chunks)
+        events = [e for e in svc.chat_stream('入库5个A1')]
+        done = [e for e in events if e['type'] == 'done'][0]
+        # 正文不含指令，action 被剥离
+        assert done['reply'].strip() == '已为您入库。'
+        assert done['actions'] == [{'action': 'stock_in', 'sku': 'A1', 'quantity': 5}]
+        # 流式 token 只推正文，不推指令
+        tokens = ''.join(e['content'] for e in events if e['type'] == 'token')
+        assert 'stock_in' not in tokens
+
+    def test_reply_is_not_yielded_twice_when_fence_late(self, svc, monkeypatch):
+        """回归：围栏出现在多 chunk 之后时，不得把已推送的正文重复推送"""
+        chunks = ['第一段', '第二段', '```action\n[{"action":"stock_out","sku":"B","quantity":1}]\n```']
+        self._make_stream_svc(svc, monkeypatch, chunks)
+        events = [e for e in svc.chat_stream('x')]
+        tokens = ''.join(e['content'] for e in events if e['type'] == 'token')
+        assert tokens == '第一段第二段'          # 无重复
+        done = [e for e in events if e['type'] == 'done'][0]
+        assert done['reply'] == '第一段第二段'    # 剥离指令后正文一致

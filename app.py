@@ -18,6 +18,7 @@ import hmac
 from flask import (
     Flask, request, jsonify, render_template, send_from_directory, send_file,
     make_response, session, redirect, url_for, has_request_context,
+    Response, stream_with_context,
 )
 from functools import wraps
 from flask.json.provider import DefaultJSONProvider
@@ -1703,6 +1704,182 @@ def api_ai_smart_import():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+def _execute_ai_actions(actions, reply):
+    """执行 AI 生成的 action 指令（每个动作独立容错，失败不中断整轮）。
+
+    - actions: AI 解析出的指令列表（无指令传 None/空）
+    - reply: 当前回复正文（create_order 会在其末尾追加下载链接）
+    返回 (log 列表, 处理后的 reply)。
+    """
+    log = []
+    if actions:
+        for act in actions:
+            try:
+                if not isinstance(act, dict):
+                    continue
+                action_type = act.get('action', '')
+                sku = _clean_cell(act.get('sku'))
+                qty = _to_int(act.get('quantity'))
+                notes = _clean_cell(act.get('notes'))
+
+                # 供应商/客户操作（不需 sku/quantity）；按名称去重，已存在则跳过不覆盖
+                if action_type == 'add_supplier':
+                    name_s = _clean_cell(act.get('name'))
+                    if name_s:
+                        if SupplierModel.get_by_name(name_s):
+                            log.append(f"供应商已存在，跳过: {name_s}")
+                        else:
+                            SupplierModel.create(name_s, act.get('contact', ''), act.get('phone', ''))
+                            log.append(f"新增供应商: {name_s}")
+                    continue
+                if action_type == 'add_customer':
+                    name_c = _clean_cell(act.get('name'))
+                    if name_c:
+                        if CustomerModel.get_by_name(name_c):
+                            log.append(f"客户已存在，跳过: {name_c}")
+                        else:
+                            CustomerModel.create(name_c, act.get('contact', ''), act.get('phone', ''))
+                            log.append(f"新增客户: {name_c}")
+                    continue
+
+                if action_type == 'create_order':
+                    # AI 创建出库单：先预检全部商品，全部通过才在事务里建客户+扣减，杜绝部分出库与垃圾客户
+                    cust_name = (act.get('customer') or '').strip()
+                    op = _op('AI')
+                    keeper = act.get('keeper') or ''
+                    wh = act.get('warehouse') or ''
+                    order_items = act.get('items') or []
+                    if not isinstance(order_items, list):
+                        order_items = []
+
+                    # 预检（不产生任何写入）
+                    plan = []
+                    problems = []
+                    for oi in order_items:
+                        if not isinstance(oi, dict):
+                            continue
+                        sku_i = _clean_cell(oi.get('sku'))
+                        qty_i = _to_int(oi.get('quantity'))
+                        price_i = _to_float(oi.get('price'))
+                        prod = ProductModel.get_by_sku(sku_i) if sku_i else None
+                        if not prod:
+                            problems.append(f"商品不存在: {sku_i or '(空)'}")
+                            continue
+                        if qty_i is None or qty_i <= 0:
+                            problems.append(f"数量无效: {prod['name']}")
+                            continue
+                        inv = db.query_one("SELECT quantity FROM inventory WHERE product_id=%s", (prod['id'],))
+                        avail = inv['quantity'] if inv else 0
+                        if avail < qty_i:
+                            problems.append(f"库存不足: {prod['name']} 当前{avail} 需{qty_i}")
+                            continue
+                        plan.append((prod, sku_i, qty_i, price_i))
+
+                    if problems:
+                        log.append("出库单未执行: " + "；".join(problems))
+                        continue
+
+                    # 全部通过 → 事务内建客户+扣减（预检失败时不会留下垃圾客户）
+                    done = []
+                    order_batch = _ai_batch_no('AI出库')   # 每单独立批次，便于追溯
+                    with db.transaction():
+                        cid = None
+                        if cust_name:
+                            existing_cust = CustomerModel.get_by_name(cust_name)
+                            cid = existing_cust['id'] if existing_cust else CustomerModel.create(cust_name)
+                        for prod, sku_i, qty_i, price_i in plan:
+                            InventoryModel.stock_out(prod['id'], qty_i, order_batch, op,
+                                                     customer_id=cid, unit_price=price_i)
+                            done.append({'name': prod['name'], 'sku': sku_i, 'quantity': qty_i,
+                                         'sale_price': price_i, 'specification': prod.get('specification', '')})
+                    # 生成 Excel
+                    import openpyxl
+                    from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
+                    from io import BytesIO
+                    now_str = datetime.now().strftime('%Y-%m-%d')
+                    wb = openpyxl.Workbook(); ws = wb.active; ws.title = '出库单'
+                    tf = Font(size=16, bold=True); hf = Font(color='FFFFFF', bold=True, size=11)
+                    hfill = PatternFill(start_color='2563EB', end_color='2563EB', fill_type='solid')
+                    bd = Border(left=Side(style='thin'), right=Side(style='thin'),
+                                top=Side(style='thin'), bottom=Side(style='thin'))
+                    ca = Alignment(horizontal='center', vertical='center')
+                    ra = Alignment(horizontal='right', vertical='center')
+                    la = Alignment(horizontal='left', vertical='center')
+                    ws.merge_cells('A1:G1'); ws['A1'] = '出 库 单'; ws['A1'].font = tf; ws['A1'].alignment = ca
+                    ws.cell(row=2, column=1, value='日期:').alignment = ra
+                    ws.cell(row=2, column=2, value=now_str).alignment = la
+                    ws.cell(row=2, column=4, value='客户:').alignment = ra
+                    ws.cell(row=2, column=5, value=cust_name).alignment = la
+                    for ci, h in enumerate(['序号','商品名称','规格','SKU','数量','单价(元)','金额(元)'], 1):
+                        c = ws.cell(row=3, column=ci, value=h); c.fill = hfill; c.font = hf; c.alignment = ca; c.border = bd
+                    total = 0
+                    for idx, oi in enumerate(done, 1):
+                        r = 3 + idx; sub = round(oi['sale_price'] * oi['quantity'], 2); total += sub
+                        for ci, v in enumerate([idx, oi['name'], oi['specification'], oi['sku'],
+                                                 oi['quantity'], oi['sale_price'], sub], 1):
+                            c = ws.cell(row=r, column=ci, value=v); c.border = bd
+                            c.alignment = ca if ci < 6 else ra
+                    sr = 3 + len(done) + 1
+                    ws.merge_cells(f'A{sr}:E{sr}'); ws.cell(row=sr, column=1, value='合计').font = Font(bold=True)
+                    ws.cell(row=sr, column=1).alignment = ra
+                    tc = ws.cell(row=sr, column=7, value=total); tc.font = Font(bold=True, color='FF0000')
+                    tc.border = bd; tc.alignment = ra
+                    bot = sr + 1
+                    ws.cell(row=bot, column=1, value='经办人:').alignment = ra
+                    ws.cell(row=bot, column=2, value=op).alignment = la
+                    ws.cell(row=bot, column=4, value='库管:').alignment = ra
+                    ws.cell(row=bot, column=5, value=keeper).alignment = la
+                    ws.cell(row=bot+1, column=1, value='仓库编号:').alignment = ra
+                    ws.cell(row=bot+1, column=2, value=wh).alignment = la
+                    for i, w in enumerate([6,22,20,15,8,12,12], 1):
+                        ws.column_dimensions[chr(64+i)].width = w
+                    safe_cust = _safe_filename_part(cust_name)
+                    fname = f"出库单_{safe_cust}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+                    fpath = os.path.join(UPLOAD_FOLDER, fname)
+                    wb.save(fpath)
+                    _cleanup_old_order_files()   # 顺手清理过期出库单，防止 uploads/ 无限增长
+                    log.append(f"出库单: {cust_name}, {len(done)}项, 合计¥{total}")
+                    reply = (reply or '出库单已创建') + f'\n\n📥 [点击下载出库单](/uploads/{fname})'
+                    continue
+
+                if action_type == 'smart_import':
+                    items = ai_service.smart_import(act.get('text', ''))
+                    if not isinstance(items, list):
+                        log.append("智能导入: AI 返回格式异常")
+                        continue
+                    for item in items:
+                        if not isinstance(item, dict):
+                            continue
+                        qty_imp = _to_int(item.get('quantity'))
+                        if qty_imp is None or qty_imp <= 0:
+                            continue
+                        _do_ai_stock_in(_clean_cell(item.get('sku')), qty_imp,
+                                        _clean_cell(item.get('name')), _clean_cell(item.get('notes')))
+                        log.append(f"智能导入: {item.get('name')} +{qty_imp}")
+                    continue
+
+                if not sku or qty is None or qty <= 0:
+                    continue
+
+                if action_type == 'stock_in':
+                    _do_ai_stock_in(sku, qty, act.get('name', ''),
+                                    unit=act.get('unit', ''), category_name=act.get('category', ''),
+                                    supplier_name=act.get('supplier', ''))
+                    log.append(f"入库: {sku} +{qty}")
+                elif action_type == 'stock_out':
+                    _do_ai_stock_out(sku, qty, notes)
+                    log.append(f"出库: {sku} -{qty}")
+                elif action_type == 'set_quantity':
+                    _do_ai_set_quantity(sku, qty, notes)
+                    log.append(f"调库: {sku} = {qty}")
+                else:
+                    log.append(f"未知操作: {action_type}")
+            except Exception as e:
+                _logger.error(f"AI 动作执行失败: {traceback.format_exc()}")
+                log.append(f"操作执行失败: {str(e)}")
+    return log, reply
+
+
 @app.route('/api/ai/chat', methods=['POST'])
 def api_ai_chat():
     """AI 对话（支持直接修改库存）"""
@@ -1714,176 +1891,10 @@ def api_ai_chat():
 
         result = ai_service.chat(message)
         actions, reply = ai_service.parse_actions(result)
+        reply = reply or result
 
         # 执行 AI 指令（每个动作独立容错，失败不会中断整轮，也不会留下 500）
-        log = []
-        if actions:
-            for act in actions:
-                try:
-                    if not isinstance(act, dict):
-                        continue
-                    action_type = act.get('action', '')
-                    sku = _clean_cell(act.get('sku'))
-                    qty = _to_int(act.get('quantity'))
-                    notes = _clean_cell(act.get('notes'))
-
-                    # 供应商/客户操作（不需 sku/quantity）；按名称去重，已存在则跳过不覆盖
-                    if action_type == 'add_supplier':
-                        name_s = _clean_cell(act.get('name'))
-                        if name_s:
-                            if SupplierModel.get_by_name(name_s):
-                                log.append(f"供应商已存在，跳过: {name_s}")
-                            else:
-                                SupplierModel.create(name_s, act.get('contact', ''), act.get('phone', ''))
-                                log.append(f"新增供应商: {name_s}")
-                        continue
-                    if action_type == 'add_customer':
-                        name_c = _clean_cell(act.get('name'))
-                        if name_c:
-                            if CustomerModel.get_by_name(name_c):
-                                log.append(f"客户已存在，跳过: {name_c}")
-                            else:
-                                CustomerModel.create(name_c, act.get('contact', ''), act.get('phone', ''))
-                                log.append(f"新增客户: {name_c}")
-                        continue
-
-                    if action_type == 'create_order':
-                        # AI 创建出库单：先预检全部商品，全部通过才在事务里建客户+扣减，杜绝部分出库与垃圾客户
-                        cust_name = (act.get('customer') or '').strip()
-                        op = _op('AI')
-                        keeper = act.get('keeper') or ''
-                        wh = act.get('warehouse') or ''
-                        order_items = act.get('items') or []
-                        if not isinstance(order_items, list):
-                            order_items = []
-
-                        # 预检（不产生任何写入）
-                        plan = []
-                        problems = []
-                        for oi in order_items:
-                            if not isinstance(oi, dict):
-                                continue
-                            sku_i = _clean_cell(oi.get('sku'))
-                            qty_i = _to_int(oi.get('quantity'))
-                            price_i = _to_float(oi.get('price'))
-                            prod = ProductModel.get_by_sku(sku_i) if sku_i else None
-                            if not prod:
-                                problems.append(f"商品不存在: {sku_i or '(空)'}")
-                                continue
-                            if qty_i is None or qty_i <= 0:
-                                problems.append(f"数量无效: {prod['name']}")
-                                continue
-                            inv = db.query_one("SELECT quantity FROM inventory WHERE product_id=%s", (prod['id'],))
-                            avail = inv['quantity'] if inv else 0
-                            if avail < qty_i:
-                                problems.append(f"库存不足: {prod['name']} 当前{avail} 需{qty_i}")
-                                continue
-                            plan.append((prod, sku_i, qty_i, price_i))
-
-                        if problems:
-                            log.append("出库单未执行: " + "；".join(problems))
-                            continue
-
-                        # 全部通过 → 事务内建客户+扣减（预检失败时不会留下垃圾客户）
-                        done = []
-                        order_batch = _ai_batch_no('AI出库')   # 每单独立批次，便于追溯
-                        with db.transaction():
-                            cid = None
-                            if cust_name:
-                                existing_cust = CustomerModel.get_by_name(cust_name)
-                                cid = existing_cust['id'] if existing_cust else CustomerModel.create(cust_name)
-                            for prod, sku_i, qty_i, price_i in plan:
-                                InventoryModel.stock_out(prod['id'], qty_i, order_batch, op,
-                                                         customer_id=cid, unit_price=price_i)
-                                done.append({'name': prod['name'], 'sku': sku_i, 'quantity': qty_i,
-                                             'sale_price': price_i, 'specification': prod.get('specification', '')})
-                        # 生成 Excel
-                        import openpyxl
-                        from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
-                        from io import BytesIO
-                        now_str = datetime.now().strftime('%Y-%m-%d')
-                        wb = openpyxl.Workbook(); ws = wb.active; ws.title = '出库单'
-                        tf = Font(size=16, bold=True); hf = Font(color='FFFFFF', bold=True, size=11)
-                        hfill = PatternFill(start_color='2563EB', end_color='2563EB', fill_type='solid')
-                        bd = Border(left=Side(style='thin'), right=Side(style='thin'),
-                                    top=Side(style='thin'), bottom=Side(style='thin'))
-                        ca = Alignment(horizontal='center', vertical='center')
-                        ra = Alignment(horizontal='right', vertical='center')
-                        la = Alignment(horizontal='left', vertical='center')
-                        ws.merge_cells('A1:G1'); ws['A1'] = '出 库 单'; ws['A1'].font = tf; ws['A1'].alignment = ca
-                        ws.cell(row=2, column=1, value='日期:').alignment = ra
-                        ws.cell(row=2, column=2, value=now_str).alignment = la
-                        ws.cell(row=2, column=4, value='客户:').alignment = ra
-                        ws.cell(row=2, column=5, value=cust_name).alignment = la
-                        for ci, h in enumerate(['序号','商品名称','规格','SKU','数量','单价(元)','金额(元)'], 1):
-                            c = ws.cell(row=3, column=ci, value=h); c.fill = hfill; c.font = hf; c.alignment = ca; c.border = bd
-                        total = 0
-                        for idx, oi in enumerate(done, 1):
-                            r = 3 + idx; sub = round(oi['sale_price'] * oi['quantity'], 2); total += sub
-                            for ci, v in enumerate([idx, oi['name'], oi['specification'], oi['sku'],
-                                                     oi['quantity'], oi['sale_price'], sub], 1):
-                                c = ws.cell(row=r, column=ci, value=v); c.border = bd
-                                c.alignment = ca if ci < 6 else ra
-                        sr = 3 + len(done) + 1
-                        ws.merge_cells(f'A{sr}:E{sr}'); ws.cell(row=sr, column=1, value='合计').font = Font(bold=True)
-                        ws.cell(row=sr, column=1).alignment = ra
-                        tc = ws.cell(row=sr, column=7, value=total); tc.font = Font(bold=True, color='FF0000')
-                        tc.border = bd; tc.alignment = ra
-                        bot = sr + 1
-                        ws.cell(row=bot, column=1, value='经办人:').alignment = ra
-                        ws.cell(row=bot, column=2, value=op).alignment = la
-                        ws.cell(row=bot, column=4, value='库管:').alignment = ra
-                        ws.cell(row=bot, column=5, value=keeper).alignment = la
-                        ws.cell(row=bot+1, column=1, value='仓库编号:').alignment = ra
-                        ws.cell(row=bot+1, column=2, value=wh).alignment = la
-                        for i, w in enumerate([6,22,20,15,8,12,12], 1):
-                            ws.column_dimensions[chr(64+i)].width = w
-                        safe_cust = _safe_filename_part(cust_name)
-                        fname = f"出库单_{safe_cust}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-                        fpath = os.path.join(UPLOAD_FOLDER, fname)
-                        wb.save(fpath)
-                        _cleanup_old_order_files()   # 顺手清理过期出库单，防止 uploads/ 无限增长
-                        log.append(f"出库单: {cust_name}, {len(done)}项, 合计¥{total}")
-                        reply = (reply or '出库单已创建') + f'\n\n📥 [点击下载出库单](/uploads/{fname})'
-                        continue
-
-                    if action_type == 'smart_import':
-                        items = ai_service.smart_import(act.get('text', ''))
-                        if not isinstance(items, list):
-                            log.append("智能导入: AI 返回格式异常")
-                            continue
-                        for item in items:
-                            if not isinstance(item, dict):
-                                continue
-                            qty_imp = _to_int(item.get('quantity'))
-                            if qty_imp is None or qty_imp <= 0:
-                                continue
-                            _do_ai_stock_in(_clean_cell(item.get('sku')), qty_imp,
-                                            _clean_cell(item.get('name')), _clean_cell(item.get('notes')))
-                            log.append(f"智能导入: {item.get('name')} +{qty_imp}")
-                        continue
-
-                    if not sku or qty is None or qty <= 0:
-                        continue
-
-                    if action_type == 'stock_in':
-                        _do_ai_stock_in(sku, qty, act.get('name', ''),
-                                        unit=act.get('unit', ''), category_name=act.get('category', ''),
-                                        supplier_name=act.get('supplier', ''))
-                        log.append(f"入库: {sku} +{qty}")
-                    elif action_type == 'stock_out':
-                        _do_ai_stock_out(sku, qty, notes)
-                        log.append(f"出库: {sku} -{qty}")
-                    elif action_type == 'set_quantity':
-                        _do_ai_set_quantity(sku, qty, notes)
-                        log.append(f"调库: {sku} = {qty}")
-                    else:
-                        log.append(f"未知操作: {action_type}")
-                except Exception as e:
-                    _logger.error(f"AI 动作执行失败: {traceback.format_exc()}")
-                    log.append(f"操作执行失败: {str(e)}")
-
-        reply = reply or result
+        log, reply = _execute_ai_actions(actions, reply)
         if log:
             reply += f'\n\n✅ 已执行: {"；".join(log)}'
 
@@ -1891,6 +1902,66 @@ def api_ai_chat():
     except Exception as e:
         _logger.error(f"AI 对话错误: {traceback.format_exc()}")
         return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/ai/chat/stream', methods=['POST'])
+def api_ai_chat_stream():
+    """AI 对话（流式 SSE）：逐字推送回复正文，指令在流末尾解析执行。
+
+    事件格式（每行均为 `data: {json}\n\n`）：
+      {"type":"token","content":"..."}   回复正文增量片段
+      {"type":"log","text":"..."}        末尾追加的执行日志（无 action 则不发）
+      {"type":"done","data":"..."}       完整回复（含下载链接/执行日志后的最终文本）
+    """
+    data = request.json or {}
+    message = data.get('message', '')
+    if not message:
+        return jsonify({'success': False, 'error': '请输入问题'}), 400
+
+    def _sse(obj):
+        return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
+
+    def _generate():
+        try:
+            full_reply = ''
+            for ev in ai_service.chat_stream(message):
+                if ev['type'] == 'token':
+                    full_reply += ev['content']
+                    try:
+                        yield _sse({'type': 'token', 'content': ev['content']})
+                    except GeneratorExit:
+                        return   # 客户端断开：停止推送，不继续执行指令
+                    continue
+                if ev['type'] == 'done':
+                    reply = ev['reply'] or ''
+                    actions = ev['actions']
+                    log, reply = _execute_ai_actions(actions, reply)
+                    reply = reply or ev['full'] or ''
+                    if log:
+                        reply += f'\n\n✅ 已执行: {"；".join(log)}'
+                    if log:
+                        yield _sse({'type': 'log', 'text': '\n'.join(log)})
+                    yield _sse({'type': 'done', 'data': reply})
+                    return
+            # 正常结束
+            return
+        except Exception as e:
+            _logger.error(f"AI 流式对话错误: {traceback.format_exc()}")
+            try:
+                yield _sse({'type': 'error', 'error': str(e)})
+            except GeneratorExit:
+                return
+            return
+
+    return Response(
+        stream_with_context(_generate()),
+        mimetype='text/event-stream',
+        headers={
+            'Cache-Control': 'no-cache',
+            'X-Accel-Buffering': 'no',
+            'Connection': 'keep-alive',
+        },
+    )
 
 
 # 关键字 → 分类自动映射
