@@ -769,13 +769,24 @@ async function runAIAnalysis(type) {
     const container = $('#ai-result');
     container.innerHTML = '<div style="text-align:center;padding:40px;color:#94a3b8;">🤖 AI 正在分析中，请稍候...</div>';
 
-    const result = await fetchAPI(`${API}/ai/analyze?type=${type}`);
-    if (result.success) {
-        // 与聊天页一致：先整体转义再渲染（防 AI 回显被污染的商品名造成存储型 XSS）
-        container.innerHTML = `<div style="white-space:pre-wrap;line-height:1.8;font-size:14px;">${renderChatReply(result.data)}</div>`;
-    } else {
-        container.innerHTML = `<div style="color:var(--danger);">分析失败: ${escapeHtml(result.error)}</div>`;
-    }
+    let acc = '';
+    streamSSE(
+        `${API}/ai/analyze/stream?type=${encodeURIComponent(type)}`,
+        // 增量：实时刷新（同样先整体转义再渲染，防 AI 回显的商品名造成存储型 XSS）
+        (chunk) => {
+            acc += chunk;
+            container.innerHTML = `<div style="white-space:pre-wrap;line-height:1.8;font-size:14px;">${renderChatReply(acc)}</div>`;
+        },
+        // 结束：用完整文本最终渲染（收敛 markdown 链接等）
+        (full) => {
+            acc = full;
+            container.innerHTML = `<div style="white-space:pre-wrap;line-height:1.8;font-size:14px;">${renderChatReply(full)}</div>`;
+        },
+        // 出错
+        (err) => {
+            container.innerHTML = `<div style="color:var(--danger);padding:20px;">分析失败: ${escapeHtml(err)}</div>`;
+        }
+    );
 }
 
 // 渲染 AI 回复：先整体转义 HTML（防 XSS），再把 [文字](/相对路径) 形式的 markdown 链接
@@ -791,19 +802,17 @@ function renderChatReply(text) {
 }
 
 // 流式拉取 AI 回复（SSE）。onToken(content) 收到增量，onDone(full, log) 结尾触发，onError(err) 出错。
-function streamAIChat(message, onToken, onDone, onError) {
+// 通用 SSE 流式请求。path=相对 URL，init=fetch 选项，回调：
+//   onToken(content)  收到 {"type":"token","content":...} 的增量
+//   onDone(data)      收到 {"type":"done","data":...}
+//   onError(err)      出错
+function streamSSE(path, onToken, onDone, onError, init = {}) {
     const controller = new AbortController();
     // 流式请求可能有较长的空闲间隔，给足 10 分钟
     const timer = setTimeout(() => controller.abort(), 600000);
-    fetch(`${API}/ai/chat/stream`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message }),
-        signal: controller.signal,
-    }).then(async (resp) => {
+    fetch(path, { ...init, signal: controller.signal }).then(async (resp) => {
         clearTimeout(timer);
         if (resp.status === 401) {
-            // 会话过期/未登录 → 跳登录页
             try { const b = await resp.json(); if (b && b.code === 'AUTH_REQUIRED') { window.location.href = '/login'; return; } } catch (_) {}
         }
         if (!resp.ok || !resp.body) {
@@ -820,7 +829,6 @@ function streamAIChat(message, onToken, onDone, onError) {
             const { done, value } = await reader.read();
             if (done) break;
             buf += decoder.decode(value, { stream: true });
-            // 按空行切分 SSE 事件（data: {...}\n\n）
             let idx;
             while ((idx = buf.indexOf('\n\n')) !== -1) {
                 const frame = buf.slice(0, idx);
@@ -833,7 +841,7 @@ function streamAIChat(message, onToken, onDone, onError) {
                     try { ev = JSON.parse(payload); } catch (_) { continue; }
                     if (ev.type === 'token') onToken(ev.content || '');
                     else if (ev.type === 'log') { /* 不单独展示，done 里已含执行日志 */ }
-                    else if (ev.type === 'done') { onDone(ev.data || '', ev.log || null); return; }
+                    else if (ev.type === 'done') { onDone(ev.data || ''); return; }
                     else if (ev.type === 'error') { lastError = ev.error || 'AI 分析出错'; }
                 }
                 if (lastError) break;
@@ -842,12 +850,24 @@ function streamAIChat(message, onToken, onDone, onError) {
         }
         if (lastError) { onError(lastError); return; }
         // 流未明确 end 事件就结束 → 兜底
-        onDone('', null);
+        onDone('');
     }).catch((err) => {
         clearTimeout(timer);
         if (err.name === 'AbortError') onError('请求超时，请稍后重试');
         else onError(`网络错误: ${err.message}`);
     });
+}
+
+function streamAIChat(message, onToken, onDone, onError) {
+    streamSSE(
+        `${API}/ai/chat/stream`,
+        onToken, onDone, onError,
+        {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ message }),
+        }
+    );
 }
 
 async function sendAIChat() {

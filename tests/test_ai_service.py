@@ -272,3 +272,30 @@ class TestChatStream:
         assert tokens == '第一段第二段'          # 无重复
         done = [e for e in events if e['type'] == 'done'][0]
         assert done['reply'] == '第一段第二段'    # 剥离指令后正文一致
+
+
+# ==========================================
+#  analyze_stream：流式分析（token / done）
+# ==========================================
+class TestAnalyzeStream:
+    def _patch(self, monkeypatch, chunks, svc):
+        monkeypatch.setattr(ai_mod.InventoryModel, 'get_all', lambda: [])
+        monkeypatch.setattr(ai_mod.StatsModel, 'get_dashboard', lambda: {
+            'total_products': 1, 'total_categories': 1, 'total_quantity': 10, 'low_stock_count': 0})
+        monkeypatch.setattr(ai_mod.InventoryModel, 'get_low_stock', lambda: [])
+        monkeypatch.setattr(ai_mod.TransactionModel, 'get_all', lambda limit=30: [])
+        monkeypatch.setattr(ai_mod.SupplierModel, 'get_all', lambda: [])
+        monkeypatch.setattr(ai_mod.CustomerModel, 'get_all', lambda: [])
+
+        def fake_stream(self, messages):
+            for c in chunks:
+                yield c
+        monkeypatch.setattr(ai_mod.AIService, '_stream_completion', fake_stream)
+
+    def test_streams_tokens_and_done(self, svc, monkeypatch):
+        self._patch(monkeypatch, ['第一', '段低库存分析', '结果'], svc)
+        events = [e for e in svc.analyze_stream('low_stock')]
+        tokens = ''.join(e['content'] for e in events if e['type'] == 'token')
+        done = [e for e in events if e['type'] == 'done'][0]
+        assert tokens == '第一段低库存分析结果'
+        assert done['data'] == '第一段低库存分析结果'

@@ -82,12 +82,17 @@ class AIService:
         try:
             with requests.post(url, json=payload, timeout=self.timeout, stream=True) as resp:
                 resp.raise_for_status()
-                for raw_line in resp.iter_lines(decode_unicode=True):
+                # 关键：LM Studio 流式响应的 Content-Type 是 `text/event-stream`（无 charset=utf-8），
+                # requests 会把 resp.encoding 默认成 ISO-8859-1，若用 decode_unicode=True 逐行解码
+                # 会把中文解析成乱码。因此强制按字节读取，再手工按 UTF-8 解码每一行。
+                for raw_line in resp.iter_lines(decode_unicode=False):
                     if not raw_line:
                         continue
+                    # 一行就是一个完整 SSE 事件，不会跨行拆散多字节字符
+                    line = raw_line.decode('utf-8', errors='replace')
                     # 只处理 "data: ..." 前缀的行
-                    if raw_line.startswith('data:'):
-                        data_str = raw_line[len('data:'):].strip()
+                    if line.startswith('data:'):
+                        data_str = line[len('data:'):].strip()
                     else:
                         continue
                     if data_str == '[DONE]':
@@ -245,16 +250,8 @@ class AIService:
         }
         return json.dumps(context, ensure_ascii=False, indent=2, cls=DecimalEncoder)
 
-    def analyze_inventory(self, query_type='general'):
-        """
-        综合库存分析
-
-        query_type:
-            - 'general': 综合分析
-            - 'low_stock': 低库存预警分析
-            - 'restock': 补货建议
-            - 'trend': 趋势分析
-        """
+    def _build_analyze_messages(self, query_type='general'):
+        """构建库存分析 prompt 消息（供非流式/流式复用），返回 messages 列表。"""
         context = self.build_inventory_context()
 
         prompts = {
@@ -312,11 +309,35 @@ class AIService:
         }
 
         prompt = prompts.get(query_type, prompts['general'])
-        messages = [
+        return [
             {'role': 'system', 'content': '你是一个专业的仓库库存管理分析助手，擅长数据分析和管理建议。请始终用中文回答。'},
             {'role': 'user', 'content': prompt},
         ]
-        return self._call(messages)
+
+    def analyze_inventory(self, query_type='general'):
+        """
+        综合库存分析
+
+        query_type:
+            - 'general': 综合分析
+            - 'low_stock': 低库存预警分析
+            - 'restock': 补货建议
+            - 'trend': 趋势分析
+        """
+        return self._call(self._build_analyze_messages(query_type))
+
+    def analyze_stream(self, query_type='general'):
+        """流式库存分析。逐段 yield 事件：
+            {'type':'token','content':...}  分析正文增量
+            {'type':'done','data':...}      完整分析正文
+        分析较长，改用流式可避免 60s 超时，边生成边显示。
+        """
+        messages = self._build_analyze_messages(query_type)
+        full = ''
+        for delta in self._stream_completion(messages):
+            full += delta
+            yield {'type': 'token', 'content': delta}
+        yield {'type': 'done', 'data': full}
 
     def chat(self, user_message):
         """

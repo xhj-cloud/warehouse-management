@@ -1601,6 +1601,50 @@ def api_ai_analyze():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+@app.route('/api/ai/analyze/stream')
+def api_ai_analyze_stream():
+    """AI 库存分析（流式 SSE）：分析较长，逐 token 推送，避免 60s 超时。
+
+    事件格式（data: {json}\n\n）：
+      {"type":"token","content":"..."}   分析增量
+      {"type":"done","data":"..."}       完整分析文本
+    """
+    query_type = request.args.get('type', 'general')
+
+    def _sse(obj):
+        return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
+
+    def _generate():
+        try:
+            for ev in ai_service.analyze_stream(query_type):
+                if ev['type'] == 'token':
+                    try:
+                        yield _sse({'type': 'token', 'content': ev['content']})
+                    except GeneratorExit:
+                        return
+                elif ev['type'] == 'done':
+                    yield _sse({'type': 'done', 'data': ev['data']})
+                    return
+            return
+        except Exception as e:
+            _logger.error(f"AI 流式分析错误: {traceback.format_exc()}")
+            try:
+                yield _sse({'type': 'error', 'error': str(e)})
+            except GeneratorExit:
+                return
+            return
+
+    return Response(
+        stream_with_context(_generate()),
+        mimetype='text/event-stream',
+        headers={
+            'Cache-Control': 'no-cache',
+            'X-Accel-Buffering': 'no',
+            'Connection': 'keep-alive',
+        },
+    )
+
+
 @app.route('/api/ai/smart-import', methods=['POST'])
 def api_ai_smart_import():
     """AI 智能导入：自然语言 → 解析 → 入库"""

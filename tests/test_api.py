@@ -711,6 +711,21 @@ class TestAIStream:
         assert resp.status_code == 400
         assert resp.get_json()['error'] == '请输入问题'
 
+    def test_analyze_stream_tokens_then_done(self, app_mod, client, monkeypatch):
+        def fake_stream(query_type):
+            yield {'type': 'token', 'content': '低库存'}
+            yield {'type': 'token', 'content': '预警'}
+            yield {'type': 'done', 'data': '低库存预警'}
+        monkeypatch.setattr(app_mod.ai_service, 'analyze_stream', fake_stream)
+
+        resp = client.get('/api/ai/analyze/stream?type=low_stock')
+        assert resp.status_code == 200
+        assert resp.headers['Content-Type'].startswith('text/event-stream')
+        body = resp.get_data(as_text=True)
+        assert 'data: {"type": "token", "content": "低库存"}' in body
+        assert '"type": "done"' in body
+        assert '"低库存预警"' in body
+
 
 # ==========================================
 #  回归：删除商品连带清理库存行（孤儿库存）

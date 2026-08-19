@@ -21,7 +21,10 @@ LM_STUDIO_CONFIG = {
     'model': os.getenv('LM_STUDIO_MODEL', 'lmstudio-community/qwen3.8-27b-q8_0.gguf/qwen3.8-27b-q8_0.gguf'),
     'temperature': 0.7,
     'max_tokens': 4096,
-    'timeout': 60,
+    # Qwen3.8 是思考型模型：会先生成 reasoning_content 再出正文，单次完整分析和
+    # 长文补货建议实测可达 80-120s，60s 太紧会误报"超时"。放宽到 180s；
+    # 流式分析/对话走 stream=True 每次只有少量增量，不受此上限影响。
+    'timeout': 180,
 }
 
 # Flask 配置
