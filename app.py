@@ -38,6 +38,7 @@ from models import (
     TransactionModel, ExcelUploadModel, StatsModel,
     SupplierModel, CustomerModel, AuditLog,
 )
+from models import UserModel, seed_admin_if_empty
 from ai_service import ai_service
 
 
@@ -63,29 +64,64 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 
 # ==========================================
-#  HTTP Basic 认证（保护一切写接口与敏感下载）
+#  认证：HTTP Basic（数据库用户表 + 环境变量超级管理员兜底）
 # ==========================================
-_AUTH_ENABLED = bool(AUTH_PASSWORD) and not AUTH_DISABLED
+# users 表为空时引导默认 admin/admin123（首次部署自动创建，不依赖硬编码哈希进 SQL）
+seed_admin_if_empty()
+
+# 认证始终启用（除非显式 DISABLE_AUTH）。
+# - 优先校验 users 表（支持多账户 + 角色）
+# - 保留环境变量 AUTH_USER/AUTH_PASSWORD 作为超级管理员兜底（不受用户表影响）
+_AUTH_ENABLED = not AUTH_DISABLED
 
 if _AUTH_ENABLED:
-    print(f"  认证已启用：/api/* 与 /uploads/* 需 Basic Auth（用户: {AUTH_USER}）")
+    print("  认证已启用：/api/* 与 /uploads/* 需 Basic Auth（数据库用户表；可用账户管理页创建）")
 else:
-    if AUTH_DISABLED:
-        print("  警告：已通过 DISABLE_AUTH 显式关闭认证（仅限本地联调，请勿用于线上/内网）")
-    else:
-        print("  警告：未设置 AUTH_PASSWORD，认证当前 DISABLED（仅限本地联调，请勿用于线上/内网）")
+    print("  警告：已通过 DISABLE_AUTH 显式关闭认证（仅限本地联调，请勿用于线上/内网）")
+
+
+def _current_username():
+    """返回当前请求已认证用户名；未认证返回 None。"""
+    auth = request.authorization
+    return auth.username if (auth and auth.username is not None) else None
 
 
 def _basic_auth_required():
-    """校验 Authorization: Basic ...；非文件上传请求失败时返回 401（带 WWW-Authenticate 触发浏览器弹窗）。"""
+    """校验 Authorization: Basic ...（数据库用户表优先，环境变量管理员兜底）。
+
+    Basic Auth 的密码校验由 werkzeug check_password_hash 完成（非明文、抗时序）。
+    """
     auth = request.authorization
-    if auth and auth.username is not None:
-        # 用 hmac.compare_digest 做常量时间比较，防时序侧信道
-        user_ok = hmac.compare_digest(str(auth.username), str(AUTH_USER))
-        pass_ok = hmac.compare_digest(str(auth.password or ''), str(AUTH_PASSWORD))
-        if user_ok and pass_ok:
-            return True
+    if not (auth and auth.username is not None):
+        return False
+    username = str(auth.username)
+
+    # 1) 数据库用户表校验
+    if UserModel.authenticate(username, auth.password or ''):
+        return True
+
+    # 2) 环境变量超级管理员兜底（常量时间比较）
+    if AUTH_PASSWORD and hmac.compare_digest(username, str(AUTH_USER)) \
+            and hmac.compare_digest(auth.password or '', str(AUTH_PASSWORD)):
+        return True
+
     return False
+
+
+def _is_admin():
+    """当前请求用户是否管理员（数据库 role=admin 或环境变量超级管理员）。"""
+    auth = request.authorization
+    if not (auth and auth.username is not None):
+        return False
+    username = str(auth.username)
+    if not _basic_auth_required():
+        return False
+    # 环境变量超级管理员
+    if AUTH_PASSWORD and hmac.compare_digest(username, str(AUTH_USER)) \
+            and hmac.compare_digest(auth.password or '', str(AUTH_PASSWORD)):
+        return True
+    user = UserModel.get_by_username(username)
+    return bool(user and user.get('role') == 'admin')
 
 
 @app.before_request
@@ -223,6 +259,86 @@ def _cleanup_old_order_files(keep_days=7):
                 pass
     except OSError:
         pass
+
+
+# ==========================================
+#  账户管理 API（仅管理员可操作）
+# ==========================================
+@app.route('/api/auth/me')
+def api_auth_me():
+    """返回当前登录用户信息（供前端显示当前账户与是否为管理员）。"""
+    username = _current_username()
+    if not username or not _basic_auth_required():
+        return jsonify({'success': False, 'error': '未认证'}), 401
+    return jsonify({'success': True, 'data': {
+        'username': username,
+        'is_admin': _is_admin(),
+    }})
+
+
+@app.route('/api/users')
+def api_users_list():
+    """列出所有账户（仅管理员）。"""
+    if not _is_admin():
+        return jsonify({'success': False, 'error': '无权限，仅管理员可查看账户'}), 403
+    try:
+        users = UserModel.get_all()
+        return jsonify({'success': True, 'data': users})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/users', methods=['POST'])
+def api_users_create():
+    """创建账户（仅管理员）。body: {username, password, role}"""
+    if not _is_admin():
+        return jsonify({'success': False, 'error': '无权限，仅管理员可创建账户'}), 403
+    try:
+        data = request.json or {}
+        username = _clean_cell(data.get('username'))
+        password = data.get('password') or ''
+        role = _clean_cell(data.get('role')) or 'user'
+        if not username:
+            return jsonify({'success': False, 'error': '用户名不能为空'}), 400
+        if len(password) < 6:
+            return jsonify({'success': False, 'error': '密码至少 6 位'}), 400
+        if role not in ('admin', 'user'):
+            role = 'user'
+        # 用户名规范化：小写去空格
+        username = username.strip().lower()
+        if UserModel.get_by_username(username):
+            return jsonify({'success': False, 'error': f'用户名 {username} 已存在'}), 400
+        uid = UserModel.create(username, password, role)
+        AuditLog.log('create', 'users', uid,
+                     new_data={'username': username, 'role': role},
+                     operator=_current_username())
+        return jsonify({'success': True, 'id': uid})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/users/<int:uid>', methods=['DELETE'])
+def api_users_delete(uid):
+    """删除账户（仅管理员；不能删除自己或最后一个管理员）。"""
+    if not _is_admin():
+        return jsonify({'success': False, 'error': '无权限，仅管理员可删除账户'}), 403
+    try:
+        target = db.query_one("SELECT * FROM users WHERE id=%s", (uid,))
+        if not target:
+            return jsonify({'success': False, 'error': '账户不存在'}), 404
+        # 不能删除自己
+        if target['username'] == _current_username():
+            return jsonify({'success': False, 'error': '不能删除当前登录的账户'}), 400
+        # 不能删除最后一个管理员
+        if target.get('role') == 'admin' and UserModel.count_admins() <= 1:
+            return jsonify({'success': False, 'error': '不能删除最后一个管理员账户'}), 400
+        UserModel.delete(uid)
+        AuditLog.log('delete', 'users', uid,
+                     new_data={'username': target['username']},
+                     operator=_current_username())
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 
 # ==========================================

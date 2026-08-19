@@ -6,6 +6,10 @@ pytest 公共配置：把项目根目录加入 sys.path，提供 app / client / 
 import os
 import sys
 
+# 本地单元/API 测试不依赖真实认证：显式关闭 HTTP Basic Auth。
+# （生产环境默认开启，由未设置 DISABLE_AUTH + 数据库用户表保证。必须在 import app 前设置。）
+os.environ.setdefault('DISABLE_AUTH', 'true')
+
 # 让 `import app` / `import models` / `import ai_service` 可用
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:

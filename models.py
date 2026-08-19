@@ -9,6 +9,7 @@ import threading
 from contextlib import contextmanager
 from config import MYSQL_CONFIG
 from datetime import datetime, date
+from werkzeug.security import generate_password_hash, check_password_hash
 
 
 def _clean_value(obj):
@@ -564,3 +565,71 @@ class AuditLog:
             "SELECT * FROM audit_log WHERE table_name=%s ORDER BY created_at DESC LIMIT %s",
             (table_name, limit)
         )
+
+
+# ==========================================
+#  系统用户（账户管理）
+# ==========================================
+class UserModel:
+    """用户表模型：密码用 werkzeug scrypt 加盐哈希存储，绝不明文保存。"""
+
+    @staticmethod
+    def create(username, password, role='user'):
+        """创建用户，返回新用户 id；用户名重复会抛 IntegrityError。"""
+        pwd_hash = generate_password_hash(password)
+        _, lid = db.execute(
+            "INSERT INTO users (username, password_hash, role) VALUES (%s, %s, %s)",
+            (username, pwd_hash, role)
+        )
+        return lid
+
+    @staticmethod
+    def get_by_username(username):
+        return db.query_one("SELECT * FROM users WHERE username=%s", (username,))
+
+    @staticmethod
+    def get_all():
+        """返回不含密码哈希的用户列表（安全：绝不把哈希发给前端）。"""
+        rows = db.query("SELECT id, username, role, created_at FROM users ORDER BY id")
+        return rows
+
+    @staticmethod
+    def authenticate(username, password):
+        """校验用户名+密码；成功返回用户信息 dict，失败返回 None。"""
+        user = UserModel.get_by_username(username)
+        if not user or not user.get('password_hash'):
+            return None
+        if check_password_hash(user['password_hash'], password or ''):
+            return user
+        return None
+
+    @staticmethod
+    def update_password(user_id, new_password):
+        pwd_hash = generate_password_hash(new_password)
+        db.execute("UPDATE users SET password_hash=%s WHERE id=%s", (pwd_hash, user_id))
+
+    @staticmethod
+    def delete(user_id):
+        db.execute("DELETE FROM users WHERE id=%s", (user_id,))
+
+    @staticmethod
+    def count_admins():
+        row = db.query_one("SELECT COUNT(*) AS n FROM users WHERE role='admin'")
+        return row['n'] if row else 0
+
+
+def seed_admin_if_empty():
+    """users 表为空时引导一个 admin/admin123 账户（首次部署自动创建，密码请尽快修改）。
+
+    幂等：仅在表为空时执行，避免每次启动重复插入/覆盖已有账户。
+    """
+    try:
+        row = db.query_one("SELECT COUNT(*) AS n FROM users")
+        if row and row['n'] == 0:
+            UserModel.create('admin', 'admin123', role='admin')
+            import logging
+            logging.getLogger(__name__).warning(
+                "已为仓库系统创建默认管理员账户 admin/admin123，请尽快登录后修改密码！")
+    except Exception:
+        # users 表可能尚未创建（init_db.sql 未执行），静默跳过
+        pass

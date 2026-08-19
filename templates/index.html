@@ -53,6 +53,9 @@
         <div class="nav-item" data-page="ai">
             <span class="icon">🤖</span> <span>AI 智能分析</span>
         </div>
+        <div class="nav-item" data-page="accounts" id="nav-accounts" style="display:none;">
+            <span class="icon">🔐</span> <span>账户管理</span>
+        </div>
     </nav>
     <div class="sidebar-footer">
         AI 模型: qwen3.6-35b-a3b<br>
@@ -492,6 +495,58 @@
                                placeholder="输入你的问题，如：当前库存有什么风险？">
                         <button class="btn btn-primary" onclick="sendAIChat()">发送</button>
                     </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- ==================== 账户管理 ==================== -->
+        <div class="page" id="page-accounts">
+            <div class="card">
+                <div class="card-header">
+                    <h3>🔐 账户管理</h3>
+                    <div style="font-size:12px;color:#94a3b8;margin-left:auto;" id="accounts-current-user"></div>
+                </div>
+                <!-- 创建账户表单 -->
+                <div class="card-body" style="padding:16px;">
+                    <h4 style="margin:0 0 12px;">创建新账户</h4>
+                    <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;">
+                        <div>
+                            <label style="font-size:12px;color:#64748b;">用户名</label>
+                            <input type="text" class="form-input" id="user-username" placeholder="登录用户名"
+                                   style="width:160px;">
+                        </div>
+                        <div>
+                            <label style="font-size:12px;color:#64748b;">密码（至少6位）</label>
+                            <input type="password" class="form-input" id="user-password" placeholder="登录密码"
+                                   style="width:160px;">
+                        </div>
+                        <div>
+                            <label style="font-size:12px;color:#64748b;">角色</label>
+                            <select class="form-input" id="user-role" style="width:120px;">
+                                <option value="user">普通用户</option>
+                                <option value="admin">管理员</option>
+                            </select>
+                        </div>
+                        <button class="btn btn-primary btn-sm" onclick="createUser()">创建账户</button>
+                    </div>
+                </div>
+                <!-- 用户列表 -->
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th style="width:60px;">ID</th>
+                            <th>用户名</th>
+                            <th>角色</th>
+                            <th>创建时间</th>
+                            <th style="width:100px;">操作</th>
+                        </tr>
+                    </thead>
+                    <tbody id="users-tbody">
+                        <tr><td colspan="5" style="text-align:center;padding:30px;color:#94a3b8;">加载中...</td></tr>
+                    </tbody>
+                </table>
+                <div style="padding:12px;font-size:12px;color:#94a3b8;">
+                    提示：删除账户不可恢复；不能删除当前登录账户，也不能删除最后一个管理员。
                 </div>
             </div>
         </div>

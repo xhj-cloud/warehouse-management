@@ -110,6 +110,7 @@ function navigateTo(page) {
         transactions: '出入库记录',
         upload: '数据导入',
         ai: 'AI 智能分析',
+        accounts: '账户管理',
     };
     $('#page-title').textContent = titles[page] || '';
     // 加载数据
@@ -125,6 +126,7 @@ function navigateTo(page) {
     if (page === 'logs') loadAuditLog();
     if (page === 'upload') loadUploads();
     if (page === 'ai') initAIPage();
+    if (page === 'accounts') loadAccounts();
 }
 
 $$('.nav-item').forEach(item => {
@@ -847,6 +849,8 @@ document.addEventListener('DOMContentLoaded', () => {
     // 加载首页
     navigateTo('dashboard');
     checkAIHealth();
+    // 探测当前账户（管理员才显示"账户管理"入口）
+    loadAuthInfo();
 });
 
 // ==========================================
@@ -1349,4 +1353,80 @@ async function uploadCustomerExcel(file) {
         if (r.success) { showToast(`成功导入 ${r.data.rows_imported} 个客户`, 'success'); loadCustomers(); }
         else showToast('导入失败: ' + r.error, 'error');
     } catch(e) { showToast('网络错误', 'error'); }
+}
+
+// ==========================================
+//  账户管理
+// ==========================================
+// 页面加载时探测当前账户：管理员才显示"账户管理"入口
+async function loadAuthInfo() {
+    // 首登时 Basic Auth 凭据可能尚未被浏览器缓存（首个 /api 请求尚未完成 401→凭据 往返），
+    // 这里最多重试 3 次，间隔 400ms，确保能拿到真实角色。
+    for (let attempt = 0; attempt < 3; attempt++) {
+        const r = await fetchAPI(`${API}/auth/me`);
+        if (r.success && r.data) {
+            const info = r.data;
+            const navAccounts = $('#nav-accounts');
+            if (navAccounts) navAccounts.style.display = info.is_admin ? '' : 'none';
+            const el = $('#accounts-current-user');
+            if (el) el.textContent = '当前登录：' + info.username + (info.is_admin ? '（管理员）' : '（普通用户）');
+            return;
+        }
+        await new Promise(res => setTimeout(res, 400));
+    }
+}
+
+async function loadAccounts() {
+    const r = await fetchAPI(`${API}/users`);
+    if (!r.success) {
+        showToast('加载账户失败: ' + r.error, 'error');
+        const t = $('#users-tbody');
+        if (t) t.innerHTML = '<tr><td colspan="5" style="text-align:center;padding:30px;color:#c00;">' + escapeHtml(r.error) + '</td></tr>';
+        return;
+    }
+    const t = $('#users-tbody');
+    if (!r.data || r.data.length === 0) {
+        t.innerHTML = '<tr><td colspan="5" style="text-align:center;padding:30px;color:#94a3b8;">暂无账户</td></tr>';
+        return;
+    }
+    t.innerHTML = r.data.map(u => `
+        <tr>
+            <td>${num(u.id)}</td>
+            <td><strong>${escapeHtml(u.username)}</strong></td>
+            <td><span class="badge ${u.role === 'admin' ? 'badge-success' : 'badge-warning'}">${u.role === 'admin' ? '管理员' : '普通用户'}</span></td>
+            <td>${formatDate(u.created_at)}</td>
+            <td><button class="btn btn-danger btn-sm" onclick="deleteUser('${num(u.id)}')">删除</button></td>
+        </tr>
+    `).join('');
+}
+
+async function createUser() {
+    const username = $('#user-username').value.trim();
+    const password = $('#user-password').value;
+    const role = $('#user-role').value;
+    if (!username) { showToast('请输入用户名', 'warning'); return; }
+    if (!password || password.length < 6) { showToast('密码至少 6 位', 'warning'); return; }
+    const r = await fetchAPI(`${API}/users`, {
+        method: 'POST',
+        body: JSON.stringify({ username, password, role }),
+    });
+    if (r.success) {
+        showToast('账户创建成功', 'success');
+        $('#user-username').value = '';
+        $('#user-password').value = '';
+        loadAccounts();
+    } else {
+        showToast('创建失败: ' + r.error, 'error');
+    }
+}
+
+async function deleteUser(uid) {
+    if (!confirm('确定删除该账户吗？此操作不可恢复。')) return;
+    const r = await fetchAPI(`${API}/users/${uid}`, { method: 'DELETE' });
+    if (r.success) {
+        showToast('账户已删除', 'success');
+        loadAccounts();
+    } else {
+        showToast('删除失败: ' + r.error, 'error');
+    }
 }

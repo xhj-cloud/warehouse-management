@@ -1462,3 +1462,46 @@ class TestOrderSubmitAtomicy:
         resp = client.post('/api/order/submit', json={'operator': 'x',
                                                       'items': [{'product_id': 3, 'quantity': 1}]})
         assert resp.status_code == 400
+
+
+# ==========================================
+#  账户管理（UserModel + /api/users）
+# ==========================================
+class TestUserManagement:
+    def test_usermodel_authenticate_passes_on_correct_password(self, app_mod, monkeypatch):
+        """UserModel.authenticate 在校验正确密码时通过（密码加盐哈希存储）。"""
+        import models as models_mod
+        from werkzeug.security import generate_password_hash
+        h = generate_password_hash('secret123')
+        user_row = {'id': 1, 'username': 'bob', 'password_hash': h, 'role': 'user'}
+        monkeypatch.setattr(models_mod.UserModel, 'get_by_username', lambda u: user_row)
+        assert models_mod.UserModel.authenticate('bob', 'secret123') is not None
+        # 错误密码返回 None
+        assert models_mod.UserModel.authenticate('bob', 'wrong') is None
+
+    def test_usermodel_authenticate_rejects_unknown_user(self, app_mod, monkeypatch):
+        import models as models_mod
+        monkeypatch.setattr(models_mod.UserModel, 'get_by_username', lambda u: None)
+        assert models_mod.UserModel.authenticate('nobody', 'x') is None
+
+    def test_create_user_route_requires_admin(self, client):
+        """非管理员 / 未配置管理员时创建账户应被拒（403 或 401）。"""
+        resp = client.post('/api/users', json={'username': 'x', 'password': '123456', 'role': 'user'})
+        # DISABLE_AUTH=true 下 _is_admin 恒 False → 403
+        assert resp.status_code == 403
+
+    def test_create_user_duplicate_username_rejected(self, app_mod, client, monkeypatch):
+        """已存在的用户名创建时应返回 400。"""
+        monkeypatch.setattr(app_mod, '_is_admin', lambda: True)
+        monkeypatch.setattr(app_mod.UserModel, 'get_by_username', lambda u: {'id': 1})
+        resp = client.post('/api/users', json={'username': 'bob', 'password': '123456', 'role': 'user'})
+        assert resp.status_code == 400
+        assert '已存在' in resp.get_json()['error']
+
+    def test_create_user_short_password_rejected(self, app_mod, client, monkeypatch):
+        monkeypatch.setattr(app_mod, '_is_admin', lambda: True)
+        monkeypatch.setattr(app_mod.UserModel, 'get_by_username', lambda u: None)
+        resp = client.post('/api/users', json={'username': 'bob', 'password': '123', 'role': 'user'})
+        assert resp.status_code == 400
+        assert '至少 6 位' in resp.get_json()['error']
+

@@ -188,6 +188,19 @@ CREATE TABLE IF NOT EXISTS audit_log (
 ) ENGINE=InnoDB;
 
 -- --------------------------------------------
+-- 8. 系统用户表（账户管理）
+-- --------------------------------------------
+CREATE TABLE IF NOT EXISTS users (
+    id              INT AUTO_INCREMENT PRIMARY KEY,
+    username        VARCHAR(50)     NOT NULL UNIQUE,
+    password_hash   VARCHAR(255)    NOT NULL,
+    role            ENUM('admin','user') DEFAULT 'user',
+    created_at      TIMESTAMP       DEFAULT CURRENT_TIMESTAMP,
+    updated_at      TIMESTAMP       DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    INDEX idx_username (username)
+) ENGINE=InnoDB;
+
+-- --------------------------------------------
 -- 插入一些示例数据
 -- --------------------------------------------
 INSERT INTO categories (name, description) VALUES
