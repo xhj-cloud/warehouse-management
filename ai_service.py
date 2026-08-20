@@ -31,6 +31,12 @@ class AIServiceError(RuntimeError):
     """
 
 
+# 分析场景的"关思考"请求体开关：Qwen3 模板级 enable_thinking=false。
+# 与 prompt 里的 /no_think（词法级）双保险，实测大上下文分析从 ~195s 降到 ~60-100s、
+# reasoning 大幅缩短。仅用于库存分析；对话/导入等场景保持默认行为不变。
+ANALYZE_EXTRA_PAYLOAD = {'chat_template_kwargs': {'enable_thinking': False}}
+
+
 class AIService:
     """AI 库存分析服务"""
 
@@ -40,9 +46,14 @@ class AIService:
         self.temperature = LM_STUDIO_CONFIG['temperature']
         self.max_tokens = LM_STUDIO_CONFIG['max_tokens']
         self.timeout = LM_STUDIO_CONFIG['timeout']
+        # 分析正文硬上限（字符数），analyze_stream 达到即截断，见 config.py 注释
+        self.max_analyze_chars = int(LM_STUDIO_CONFIG.get('max_analyze_chars', 600))
 
-    def _call(self, messages):
-        """调用 LM Studio API。连接失败/超时抛 AIServiceError，不再吞成字符串误导上层。"""
+    def _call(self, messages, extra_payload=None):
+        """调用 LM Studio API。连接失败/超时抛 AIServiceError，不再吞成字符串误导上层。
+
+        extra_payload：可选的额外请求体字段（如分析场景的关思考开关），原样并入 payload。
+        """
         url = f"{self.base_url}/chat/completions"
         payload = {
             'model': self.model,
@@ -50,6 +61,8 @@ class AIService:
             'temperature': self.temperature,
             'max_tokens': self.max_tokens,
         }
+        if extra_payload:
+            payload.update(extra_payload)
         try:
             resp = requests.post(url, json=payload, timeout=self.timeout)
             resp.raise_for_status()
@@ -66,8 +79,8 @@ class AIService:
         except Exception as e:
             raise AIServiceError(f"AI 分析出错: {str(e)}") from None
 
-    def _stream_completion(self, messages):
-        """低层流式调用：逐块 yield (kind, 文本)。
+    def _stream_completion(self, messages, extra_payload=None):
+        """低层流式调用：逐块 yield (kind, 文本)。extra_payload 同 _call，可选并入请求体。
 
         kind ∈ {'thinking','token'}：
         - 'thinking'：模型的内心推理片段（reasoning_content）。Qwen3 思考型模型会先长时间
@@ -85,6 +98,8 @@ class AIService:
             'max_tokens': self.max_tokens,
             'stream': True,   # 关键：启用 SSE 流式
         }
+        if extra_payload:
+            payload.update(extra_payload)
         try:
             with requests.post(url, json=payload, timeout=self.timeout, stream=True) as resp:
                 resp.raise_for_status()
@@ -304,7 +319,7 @@ class AIService:
 3. 补货时间窗口建议
 4. 库存周转优化策略
 
-请用中文输出详细分析。""",
+请用中文输出精炼建议（要点式，正文总长受 system 规则限制）。""",
 
             'trend': f"""你是一个专业的仓库库存管理分析助手。请根据以下库存和交易数据，分析库存变化趋势。
 
@@ -322,9 +337,12 @@ class AIService:
 
         prompt = prompts.get(query_type, prompts['general'])
         return [
-            {'role': 'system', 'content': '你是一个专业的仓库库存管理分析助手，擅长数据分析和管理建议。请始终用中文回答。'
-                                         '注意：请直接给出结论和可执行建议，尽量简短思考、不要长篇输出内心推理过程，聚焦干货。'},
-            {'role': 'user', 'content': prompt},
+            {'role': 'system', 'content': f'你是一个专业的仓库库存管理分析助手，擅长数据分析和管理建议。请始终用中文回答。'
+                                         '注意：请直接给出结论和可执行建议，尽量简短思考、不要长篇输出内心推理过程，聚焦干货。'
+                                          f'正文总长必须严格控制在 {self.max_analyze_chars} 字以内——用要点或表格精炼表达，只列最重要的商品和建议数量，不要展开论述、不要重复数据。'},
+            # /no_think：Qwen3 系列开关词，关闭内心推理直接作答。实测分析从 ~195s（4600+ 条 thinking）
+            # 降到 ~10-30s、reasoning 几乎为零；配合上面的正文字数上限，分析又快又短。
+            {'role': 'user', 'content': prompt + '\n/no_think'},
         ]
 
     def analyze_inventory(self, query_type='general'):
@@ -337,7 +355,7 @@ class AIService:
             - 'restock': 补货建议
             - 'trend': 趋势分析
         """
-        return self._call(self._build_analyze_messages(query_type))
+        return self._call(self._build_analyze_messages(query_type), ANALYZE_EXTRA_PAYLOAD)
 
     def analyze_stream(self, query_type='general'):
         """流式库存分析。逐段 yield 事件：
@@ -345,15 +363,26 @@ class AIService:
             {'type':'token','content':...}      分析正文增量
             {'type':'done','data':...}          完整分析正文
         分析较长，改用流式可避免 60s 超时；思考型模型的推理也转发，避免思考期"无输出"像卡死。
+
+        正文长度硬上限（self.max_analyze_chars）：prompt 约束模型写短之外再加保险——
+        累计达到上限即停止读取流并直接返回 done。break 会关闭 _stream_completion 生成器，
+        底层 requests 连接随之断开，LM Studio 侧的生成也会提前终止，省时间。
         """
         messages = self._build_analyze_messages(query_type)
         full = ''
-        for kind, delta in self._stream_completion(messages):
+        limit = self.max_analyze_chars
+        for kind, delta in self._stream_completion(messages, ANALYZE_EXTRA_PAYLOAD):
             if kind == 'thinking':
                 yield {'type': 'thinking', 'content': delta}
-            else:
-                full += delta
-                yield {'type': 'token', 'content': delta}
+                continue
+            remaining = limit - len(full)
+            if remaining <= 0:
+                break                       # 已达上限，停止读取流
+            piece = delta[:remaining]       # 恰好截到上限，不多推一个字符
+            full += piece
+            yield {'type': 'token', 'content': piece}
+            if len(piece) < len(delta):
+                break                       # 正好触顶，无需再读
         yield {'type': 'done', 'data': full}
 
     def chat(self, user_message):

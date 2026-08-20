@@ -555,6 +555,8 @@ class TestAI:
         body = resp.get_json()
         assert body['success'] is True
         assert 'qwen3.6-35b-a3b' in body['message']
+        # model 字段必须等于后端实际调用所用的模型（config 配置值），前端据此显示，避免写死不一致
+        assert body['model'] == app_mod.ai_service.model
 
     def test_health_down(self, app_mod, client, monkeypatch):
         import ai_service as ai_mod

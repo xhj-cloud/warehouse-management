@@ -28,6 +28,10 @@ LM_STUDIO_CONFIG = {
     # 长文补货建议实测可达 80-120s，60s 太紧会误报"超时"。放宽到 180s；
     # 流式分析/对话走 stream=True 每次只有少量增量，不受此上限影响。
     'timeout': 180,
+    # 库存分析正文硬上限（字符数）：思考型模型容易长篇大论，单次分析实测可达 3000+ 字、
+    # 耗时 2-4 分钟。除在 system prompt 里约束"简短"外，analyze_stream 还按此值做硬截断——
+    # 正文累计达到该长度即停止读取流并直接返回（同时提前断开与 LM Studio 的连接）。
+    'max_analyze_chars': int(os.getenv('ANALYZE_MAX_CHARS', '600')),
 }
 
 # Flask 配置

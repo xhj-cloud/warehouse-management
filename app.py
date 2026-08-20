@@ -1584,9 +1584,14 @@ def api_upload_customers():
 # ==========================================
 @app.route('/api/ai/health')
 def api_ai_health():
-    """AI 服务健康检查"""
+    """AI 服务健康检查。
+
+    model 字段返回后端实际调用所用的模型（来自 config.LM_STUDIO_CONFIG，即 _call/_stream_completion
+    真正发给 LM Studio 的 model），前端侧边栏据此显示——避免写死在 HTML 里与实际调用不一致。
+    该值与 LM Studio 是否在线无关（离线时也能正确显示配置）。
+    """
     ok, msg = ai_service.health_check()
-    return jsonify({'success': ok, 'message': msg})
+    return jsonify({'success': ok, 'message': msg, 'model': ai_service.model})
 
 
 @app.route('/api/ai/analyze')

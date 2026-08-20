@@ -759,9 +759,18 @@ async function checkAIHealth() {
             status.className = 'ai-status offline';
             text.textContent = 'AI 服务离线';
         }
+        // 侧边栏模型名：用后端返回的"实际调用模型"（config 配置值），不再写死在 HTML。
+        // 完整路径形如 lmstudio-community/qwen3.8-27b-q8_0.gguf/qwen3.8-27b-q8_0.gguf，
+        // 取最后一段并去掉 .gguf 后缀显示短名（qwen3.8-27b-q8_0）。
+        const modelEl = $('#ai-model-name');
+        if (modelEl && result.model) {
+            modelEl.textContent = String(result.model).split('/').pop().replace(/\.gguf$/i, '');
+        }
     } catch {
         status.className = 'ai-status offline';
         text.textContent = 'AI 服务离线';
+        const modelEl = $('#ai-model-name');
+        if (modelEl) modelEl.textContent = '未知';
     }
 }
 
