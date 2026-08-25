@@ -60,7 +60,9 @@ warehouse-management/
 
 ### 首次启动
 
-- 数据库 `users` 表为空时，应用启动自动创建默认管理员：**`admin` / `admin123`**
+- 数据库 `users` 表为空时，应用启动自动创建管理员账户 **`admin`**（不内置任何固定默认密码）：
+  - 设置了环境变量 `AUTH_PASSWORD` → 用它作为初始密码；
+  - 未设置 → 自动生成一次性随机强密码并打印到启动日志（仅此一次显示，请妥善保存）。
 - 登录后建议立即在「账户管理」页修改密码或创建自己的账户
 
 ### 角色区别
@@ -105,7 +107,7 @@ chmod +x deploy.sh
 ./deploy.sh
 ```
 
-部署脚本会交互式询问 MySQL 密码、AI 地址、端口等，确认后自动完成全部配置。
+部署脚本会交互式询问 MySQL 密码（必填）、管理员初始密码（必填）、AI 地址、端口等，确认后自动完成全部配置。
 
 **方式二：手动部署**
 
@@ -125,10 +127,10 @@ mysql -u warehouse -p warehouse_db < init_db.sql
 python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 
-# 5. 配置环境变量（修改 config.py 或创建 .env）
-# DB_HOST / DB_PASSWORD / LM_STUDIO_URL / AUTH_USER / AUTH_PASSWORD 等
+# 5. 配置环境变量：复制示例并填写自己的密码（DB_PASSWORD / AUTH_PASSWORD 必填）
+cp .env.example .env && vim .env
 
-# 6. 启动（首次启动自动创建 admin/admin123）
+# 6. 启动（首次启动 users 表为空时自动创建 admin；初始密码来自 AUTH_PASSWORD，未设置则打印随机密码到日志）
 python app.py
 # 访问 http://服务器IP:5050 → 跳转登录页
 ```
@@ -147,9 +149,9 @@ User=$USER
 WorkingDirectory=$(pwd)
 Environment="DB_HOST=localhost"
 Environment="DB_USER=warehouse"
-Environment="DB_PASSWORD=your_password"
+Environment="DB_PASSWORD=你的数据库密码"
 Environment="AUTH_USER=admin"
-Environment="AUTH_PASSWORD=admin123"
+Environment="AUTH_PASSWORD=你的管理员初始密码"
 ExecStart=$(pwd)/venv/bin/python $(pwd)/app.py
 Restart=always
 
@@ -177,17 +179,17 @@ brew services start mysql
 
 # 4. 创建数据库
 mysql -u root -e "CREATE DATABASE warehouse_db CHARACTER SET utf8mb4;
-  CREATE USER 'warehouse'@'localhost' IDENTIFIED BY 'warehouse123';
+  CREATE USER 'warehouse'@'localhost' IDENTIFIED BY '<你的数据库密码>';
   GRANT ALL ON warehouse_db.* TO 'warehouse'@'localhost'; FLUSH PRIVILEGES;"
 
 # 5. 安装运行
 cd warehouse-management
 python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
-mysql -u warehouse -pwarehouse123 warehouse_db < init_db.sql
+mysql -u warehouse -p<你的数据库密码> warehouse_db < init_db.sql
 python app.py
 
-# 访问 http://localhost:5050 → 跳转登录页（admin/admin123）
+# 访问 http://localhost:5050 → 跳转登录页（admin 初始密码见启动日志或 AUTH_PASSWORD）
 ```
 
 ---
@@ -220,14 +222,14 @@ pip install -r requirements.txt
 
 # 创建数据库
 mysql -u root -e "CREATE DATABASE warehouse_db CHARACTER SET utf8mb4;
-  CREATE USER 'warehouse'@'localhost' IDENTIFIED BY 'warehouse123';
+  CREATE USER 'warehouse'@'localhost' IDENTIFIED BY '<你的数据库密码>';
   GRANT ALL ON warehouse_db.* TO 'warehouse'@'localhost'; FLUSH PRIVILEGES;"
 
-mysql -u warehouse -pwarehouse123 warehouse_db < init_db.sql
+mysql -u warehouse -p<你的数据库密码> warehouse_db < init_db.sql
 
 # 启动
 python app.py
-# 访问 http://localhost:5050 → 跳转登录页（admin/admin123）
+# 访问 http://localhost:5050 → 跳转登录页（admin 初始密码见启动日志或 AUTH_PASSWORD）
 ```
 
 ---
@@ -235,17 +237,17 @@ python app.py
 ### Docker 部署
 
 ```bash
-# 使用 docker-compose
+# 使用 docker-compose（先 cp .env.example .env 并填写 DB_PASSWORD / MYSQL_ROOT_PASSWORD / AUTH_PASSWORD）
 docker compose up -d
 
 # 或手动构建
 docker build -t warehouse .
 docker run -d -p 5050:5050 \
   -e DB_HOST=mysql_host \
-  -e DB_PASSWORD=your_password \
+  -e DB_PASSWORD=你的数据库密码 \
   -e LM_STUDIO_URL=http://your-lmstudio:1234/v1 \
   -e AUTH_USER=admin \
-  -e AUTH_PASSWORD=admin123 \
+  -e AUTH_PASSWORD=你的管理员初始密码 \
   warehouse
 ```
 
@@ -255,7 +257,7 @@ AI 功能依赖 LM Studio，不配置也不影响基础仓库管理功能。
 
 ```bash
 # 1. 在 AI 服务器上下载 LM Studio（lmstudio.ai）
-# 2. 下载模型 qwen3.6-35b-a3b 或其他兼容模型
+# 2. 下载 Qwen3.8-27B（qwen3.8-27b-q8_0.gguf）或其他 OpenAI 兼容模型
 # 3. 启动 LM Studio 的本地 API 服务（默认端口 1234）
 # 4. 在 config.py 或 .env 中配置 LM_STUDIO_URL
 ```
@@ -302,7 +304,7 @@ pytest tests/ -v
 
 # 指向服务器数据库跑集成测试（需 CREATE/DROP DATABASE 权限；
 # 会自动创建 warehouse_test_<pid> 独立库并在结束后删除，不触碰业务数据）
-DB_HOST=100.101.108.100 pytest tests/test_integration.py -v
+DB_HOST=<你的数据库服务器IP> pytest tests/test_integration.py -v
 ```
 
 ## 安全修复记录

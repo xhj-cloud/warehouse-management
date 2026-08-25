@@ -60,24 +60,32 @@ ask_config() {
     echo "   MySQL:    $($DETECTED_MYSQL -e "SELECT VERSION()" 2>/dev/null || echo "未检测到")"
     echo ""
 
-    echo -e "${Y}🔧 请配置以下信息（回车使用默认值）:${N}"
+    echo -e "${Y}🔧 请配置以下信息（回车使用默认值；密码无默认值，必须自行设定）:${N}"
     echo ""
 
     read -p "1. 项目安装路径 [${DETECTED_PROJECT}]: " v; PROJECT_DIR="${v:-$DETECTED_PROJECT}"
-    read -p "2. MySQL 密码 [warehouse123]: " v; MYSQL_PASSWORD="${v:-warehouse123}"
+    while true; do
+        read -rp "2. MySQL 密码（必填，无默认值）: " v
+        [ -n "$v" ] && break || echo -e "${R}   ⚠️  密码不能为空，请重新输入${N}"
+    done; MYSQL_PASSWORD="$v"
     read -p "3. 数据库用户 [warehouse]: " v; MYSQL_USER="${v:-warehouse}"
     read -p "4. 数据库名 [warehouse_db]: " v; MYSQL_DB="${v:-warehouse_db}"
-    read -p "5. AI 地址 [http://127.0.0.1:1234/v1]: " v; AI_URL="${v:-http://127.0.0.1:1234/v1}"
-    read -p "6. AI 模型 [qwen3.6-35b-a3b]: " v; AI_MODEL="${v:-qwen3.6-35b-a3b}"
-    read -p "7. 服务端口 [5050]: " v; SERVICE_PORT="${v:-5050}"
-    read -p "8. 安装 Nginx? [Y/n]: " v; INSTALL_NGINX="${v:-y}"
-    read -p "9. 全新安装(会装 MySQL/Nginx)? [Y/n]: " v; IS_FRESH="${v:-y}"
+    while true; do
+        read -rp "5. 管理员初始密码（必填，无默认值）: " v
+        [ -n "$v" ] && break || echo -e "${R}   ⚠️  密码不能为空，请重新输入${N}"
+    done; ADMIN_PASSWORD="$v"
+    read -p "6. AI 地址 [http://127.0.0.1:1234/v1]: " v; AI_URL="${v:-http://127.0.0.1:1234/v1}"
+    read -p "7. AI 模型 [qwen3.8-27b-q8_0]: " v; AI_MODEL="${v:-lmstudio-community/qwen3.8-27b-q8_0.gguf/qwen3.8-27b-q8_0.gguf}"
+    read -p "8. 服务端口 [5050]: " v; SERVICE_PORT="${v:-5050}"
+    read -p "9. 安装 Nginx? [Y/n]: " v; INSTALL_NGINX="${v:-y}"
+    read -p "10. 全新安装(会装 MySQL/Nginx)? [Y/n]: " v; IS_FRESH="${v:-y}"
 
     echo ""
     echo -e "${Y}────────────────────────────────────────${N}"
     echo -e "${C}📋 部署确认:${N}"
     printf "   %-14s %s\n" "项目路径:" "$PROJECT_DIR"
-    printf "   %-14s %s\n" "MySQL:" "$MYSQL_USER / $MYSQL_PASSWORD @ $MYSQL_DB"
+    printf "   %-14s %s\n" "MySQL:" "$MYSQL_USER / ******** @ $MYSQL_DB"
+    printf "   %-14s %s\n" "管理员账户:" "admin（初始密码为上方第 5 项所设，此处不回显）"
     printf "   %-14s %s\n" "AI:" "$AI_URL ($AI_MODEL)"
     printf "   %-14s %s\n" "端口:" "$SERVICE_PORT"
     printf "   %-14s %s\n" "Nginx:" "$(is_yes "$INSTALL_NGINX" && echo "是" || echo "否")"
@@ -152,7 +160,7 @@ deploy_files() {
 generate_config() {
     step "4/7" "生成配置文件..."
 
-    # 仅当 .env 不存在时创建
+    # 仅当 .env 不存在时创建（config.py 启动时会加载它；systemd Environment= 优先级更高）
     if [ ! -f "$PROJECT_DIR/.env" ]; then
         cat > "$PROJECT_DIR/.env" << EOF
 DB_HOST=localhost
@@ -162,16 +170,13 @@ DB_PASSWORD=$MYSQL_PASSWORD
 DB_NAME=$MYSQL_DB
 LM_STUDIO_URL=$AI_URL
 LM_STUDIO_MODEL=$AI_MODEL
+AUTH_USER=admin
+AUTH_PASSWORD=$ADMIN_PASSWORD
 SECRET_KEY=$(python3 -c "import secrets; print(secrets.token_hex(32))" 2>/dev/null || echo "auto-$(date +%s)")
 EOF
+        chmod 600 "$PROJECT_DIR/.env"
     fi
-
-    # 更新 config.py（安全替换）
-    if [ -f "$PROJECT_DIR/config.py" ]; then
-        sed -i "s|http://100.101.108.100:1234/v1|$AI_URL|" "$PROJECT_DIR/config.py"
-        sed -i "s|'model': os.getenv('LM_STUDIO_MODEL', '[^']*'|'model': os.getenv('LM_STUDIO_MODEL', '$AI_MODEL'|" "$PROJECT_DIR/config.py"
-    fi
-    ok "配置生成完成"
+    ok "配置生成完成（.env 权限已设为 600）"
 }
 
 # ---- 5. 初始化数据库 ----
@@ -236,6 +241,8 @@ Environment="DB_HOST=localhost"
 Environment="DB_USER=$MYSQL_USER"
 Environment="DB_PASSWORD=$MYSQL_PASSWORD"
 Environment="DB_NAME=$MYSQL_DB"
+Environment="AUTH_USER=admin"
+Environment="AUTH_PASSWORD=$ADMIN_PASSWORD"
 Environment="LM_STUDIO_URL=$AI_URL"
 Environment="LM_STUDIO_MODEL=$AI_MODEL"
 ExecStart=$VENV_DIR/bin/python $PROJECT_DIR/app.py
@@ -297,6 +304,8 @@ show_done() {
     echo ""
     echo -e "  ${G}📍 访问:${N}  http://${SERVER_IP:-localhost}:$SERVICE_PORT"
     is_yes "$INSTALL_NGINX" && echo -e "            http://${SERVER_IP:-localhost}"
+    echo ""
+    echo -e "  ${G}🔐 登录:${N}  admin / （部署时第 5 项设定的初始密码，登录后请修改）"
     echo ""
     echo -e "  ${G}🔧 管理:${N}"
     echo "     sudo systemctl status warehouse"

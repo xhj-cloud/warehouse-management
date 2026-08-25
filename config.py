@@ -4,12 +4,19 @@
 
 import os
 
+from dotenv import load_dotenv
+
+# 加载项目根目录的 .env（若存在）。不覆盖已存在的环境变量：
+# systemd Environment= / shell export 的优先级高于 .env。
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
+
 # MySQL 数据库配置
 MYSQL_CONFIG = {
     'host': os.getenv('DB_HOST', 'localhost'),
     'port': int(os.getenv('DB_PORT', 3306)),
     'user': os.getenv('DB_USER', 'warehouse'),
-    'password': os.getenv('DB_PASSWORD', 'warehouse123'),
+    # 必填：不再内置默认密码，请通过 .env / systemd Environment= 自行设定强密码
+    'password': os.getenv('DB_PASSWORD', ''),
     'database': os.getenv('DB_NAME', 'warehouse_db'),
     'charset': 'utf8mb4',
 }
@@ -43,11 +50,12 @@ ALLOWED_EXTENSIONS = {'xlsx', 'xls', 'csv'}
 # ==========================================
 # HTTP Basic 认证（防内网任意 curl 直接改库存/删数据）
 # ------------------------------------------
-# 生产/内网部署：务必设置 AUTH_USER / AUTH_PASSWORD；未设置时认证禁用并打印警告，
-# 仅用于纯本地快速联调。禁用方式：DISABLE_AUTH=true（回退到无认证，谨慎）。
+# 生产/内网部署：务必设置 AUTH_USER / AUTH_PASSWORD。
+# 显式关闭认证仅用于纯本地快速联调：DISABLE_AUTH=true（回退到无认证，谨慎）。
 # ==========================================
 AUTH_USER = os.getenv('AUTH_USER', 'admin')
-AUTH_PASSWORD = os.getenv('AUTH_PASSWORD', '')      # 空则认证禁用（本地联调）
+# 超级管理员兜底密码；留空则无兜底（首次启动 users 表为空时会自动生成随机初始密码并打印到日志）
+AUTH_PASSWORD = os.getenv('AUTH_PASSWORD', '')
 AUTH_DISABLED = os.getenv('DISABLE_AUTH', '').lower() in ('1', 'true', 'yes')
 
 # 库存预警阈值

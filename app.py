@@ -35,7 +35,7 @@ from werkzeug.utils import secure_filename
 
 from config import (
     UPLOAD_FOLDER, ALLOWED_EXTENSIONS, SECRET_KEY, MAX_CONTENT_LENGTH,
-    AUTH_USER, AUTH_PASSWORD, AUTH_DISABLED,
+    AUTH_USER, AUTH_PASSWORD, AUTH_DISABLED, LM_STUDIO_CONFIG,
 )
 from models import (
     db, CategoryModel, ProductModel, InventoryModel,
@@ -74,7 +74,8 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 # ==========================================
 #  认证：Session 登录（数据库用户表 + 环境变量超级管理员兜底）
 # ==========================================
-# users 表为空时引导默认 admin/admin123（首次部署自动创建，不依赖硬编码哈希进 SQL）
+# users 表为空时引导 admin 账户：密码取环境变量 AUTH_PASSWORD，未设置则生成一次性随机密码并打印到日志
+# （见 models.seed_admin_if_empty；不再内置任何固定默认密码）
 seed_admin_if_empty()
 
 # 认证始终启用（除非显式 DISABLE_AUTH）。
@@ -2119,6 +2120,6 @@ if __name__ == '__main__':
     print("=" * 60)
     print("  仓库管理系统启动中...")
     print("  访问地址: http://0.0.0.0:5050")
-    print("  AI 服务: http://100.101.108.100:1234")
+    print(f"  AI 服务: {LM_STUDIO_CONFIG['base_url']}")
     print("=" * 60)
     app.run(host='0.0.0.0', port=5050, debug=True)

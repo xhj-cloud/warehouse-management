@@ -1,6 +1,9 @@
 # ============================================
 #  仓库管理系统 - Docker Compose 配置
-#  使用方式: docker compose up -d
+#  使用方式:
+#    1. cp .env.example .env   # 并填写 DB_PASSWORD / MYSQL_ROOT_PASSWORD / AUTH_PASSWORD
+#    2. docker compose up -d
+#  密码一律从项目目录的 .env 读取（本文件不内置任何默认密码）
 # ============================================
 
 version: '3.8'
@@ -12,10 +15,10 @@ services:
     container_name: warehouse-mysql
     restart: always
     environment:
-      MYSQL_ROOT_PASSWORD: root123
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?请在 .env 中设置 MYSQL_ROOT_PASSWORD（MySQL root 密码）}
       MYSQL_DATABASE: warehouse_db
       MYSQL_USER: warehouse
-      MYSQL_PASSWORD: warehouse123
+      MYSQL_PASSWORD: ${DB_PASSWORD:?请在 .env 中设置 DB_PASSWORD（应用数据库密码）}
     ports:
       - "3306:3306"
     volumes:
@@ -37,10 +40,12 @@ services:
       DB_HOST: mysql
       DB_PORT: 3306
       DB_USER: warehouse
-      DB_PASSWORD: warehouse123
+      DB_PASSWORD: ${DB_PASSWORD:?请在 .env 中设置 DB_PASSWORD（应用数据库密码）}
       DB_NAME: warehouse_db
-      LM_STUDIO_URL: http://100.101.108.100:1234/v1
-      LM_STUDIO_MODEL: qwen3.6-35b-a3b
+      LM_STUDIO_URL: http://127.0.0.1:1234/v1
+      # 管理员初始密码：首次启动 users 表为空时用它创建 admin；留空则自动生成随机密码并打印到日志
+      AUTH_USER: ${AUTH_USER:-admin}
+      AUTH_PASSWORD: ${AUTH_PASSWORD:-}
     volumes:
       - ./uploads:/app/uploads
     depends_on:

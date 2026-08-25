@@ -59,9 +59,10 @@
     </nav>
     <div class="sidebar-footer">
         AI 模型: <span id="ai-model-name">加载中…</span><br>
-        服务器: 100.101.108.100
+        服务器: <span id="server-host"></span>
     </div>
 </aside>
+<script>document.getElementById('server-host').textContent = location.hostname || 'localhost';</script>
 
 <!-- ================================
      主内容区

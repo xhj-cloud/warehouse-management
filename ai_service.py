@@ -604,7 +604,7 @@ OCR 识别文字：
                 return True, f"AI 服务正常，可用模型: {', '.join(models) if models else '未知'}"
             return False, f"AI 服务返回异常状态码: {resp.status_code}"
         except requests.exceptions.ConnectionError:
-            return False, "无法连接到 LM Studio，请确认 http://100.101.108.100:1234 已启动"
+            return False, f"无法连接到 LM Studio，请确认 {self.base_url} 已启动"
         except Exception as e:
             return False, f"AI 服务检查失败: {str(e)}"
 

@@ -5,7 +5,7 @@
   结束后 DROP，**不触碰任何业务数据**。
 - MySQL 不可达时整个模块自动跳过（本地无数据库也能跑其余单测）。
 - 可通过环境变量指向服务器数据库，例如：
-    DB_HOST=100.101.108.100 pytest tests/test_integration.py -v
+    DB_HOST=<你的数据库服务器IP> pytest tests/test_integration.py -v
   （需要该账号具备 CREATE/DROP DATABASE 权限）
 """
 

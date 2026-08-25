@@ -619,17 +619,37 @@ class UserModel:
 
 
 def seed_admin_if_empty():
-    """users 表为空时引导一个 admin/admin123 账户（首次部署自动创建，密码请尽快修改）。
+    """users 表为空时引导一个 admin 账户（首次部署自动创建，幂等）。
 
-    幂等：仅在表为空时执行，避免每次启动重复插入/覆盖已有账户。
+    密码策略——不内置任何固定默认密码：
+    - 设置了环境变量 AUTH_PASSWORD → 用它作为 admin 初始密码；
+    - 未设置 → 生成一次性随机强密码并打印到启动日志（仅此一次显示）。
+    仅在表为空时执行，避免每次启动重复插入/覆盖已有账户。
     """
     try:
         row = db.query_one("SELECT COUNT(*) AS n FROM users")
-        if row and row['n'] == 0:
-            UserModel.create('admin', 'admin123', role='admin')
-            import logging
-            logging.getLogger(__name__).warning(
-                "已为仓库系统创建默认管理员账户 admin/admin123，请尽快登录后修改密码！")
+        if not (row and row['n'] == 0):
+            return
+        import os as _os
+        import secrets, string as _string
+        initial_pw = (_os.getenv('AUTH_PASSWORD') or '').strip()
+        generated = False
+        if not initial_pw:
+            initial_pw = 'Wm-' + ''.join(
+                secrets.choice(_string.ascii_letters + _string.digits) for _ in range(16))
+            generated = True
+        UserModel.create('admin', initial_pw, role='admin')
+        import logging
+        log = logging.getLogger(__name__)
+        if generated:
+            print("=" * 58)
+            print("【首次部署】已自动创建管理员账户：admin")
+            print(f"初始密码（仅本次显示，请妥善保存）：{initial_pw}")
+            print("登录后请立即在「账户管理」页修改密码！")
+            print("=" * 58)
+        else:
+            log.warning(
+                "已使用环境变量 AUTH_PASSWORD 创建默认管理员账户 admin，建议登录后修改密码。")
     except Exception:
         # users 表可能尚未创建（init_db.sql 未执行），静默跳过
         pass
