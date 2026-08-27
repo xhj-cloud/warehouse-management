@@ -31,10 +31,11 @@ class AIServiceError(RuntimeError):
     """
 
 
-# 分析场景的"关思考"请求体开关：Qwen3 模板级 enable_thinking=false。
+# "关思考"请求体开关：Qwen3 模板级 enable_thinking=false。
 # 与 prompt 里的 /no_think（词法级）双保险，实测大上下文分析从 ~195s 降到 ~60-100s、
-# reasoning 大幅缩短。仅用于库存分析；对话/导入等场景保持默认行为不变。
-ANALYZE_EXTRA_PAYLOAD = {'chat_template_kwargs': {'enable_thinking': False}}
+# reasoning 大幅缩短。库存分析与 AI 对话统一使用：关思考直接作答，
+# 避免思考型模型长时间只出推理、前端看着像卡死。
+NO_THINK_EXTRA_PAYLOAD = {'chat_template_kwargs': {'enable_thinking': False}}
 
 
 class AIService:
@@ -46,8 +47,6 @@ class AIService:
         self.temperature = LM_STUDIO_CONFIG['temperature']
         self.max_tokens = LM_STUDIO_CONFIG['max_tokens']
         self.timeout = LM_STUDIO_CONFIG['timeout']
-        # 分析正文硬上限（字符数），analyze_stream 达到即截断，见 config.py 注释
-        self.max_analyze_chars = int(LM_STUDIO_CONFIG.get('max_analyze_chars', 600))
 
     def _call(self, messages, extra_payload=None):
         """调用 LM Studio API。连接失败/超时抛 AIServiceError，不再吞成字符串误导上层。
@@ -183,12 +182,13 @@ class AIService:
 - 先自然回复，再放指令"""
         messages = [
             {'role': 'system', 'content': system_prompt},
-            {'role': 'user', 'content': user_message},
+            # /no_think：Qwen3 系列词法开关，配合 NO_THINK_EXTRA_PAYLOAD（模板级）双保险关思考
+            {'role': 'user', 'content': user_message + '\n/no_think'},
         ]
         full = ''
         yielded = 0          # full 中已经推送给前端的正文长度（避免围栏触发时重复推送）
         in_action = False
-        for kind, delta in self._stream_completion(messages):
+        for kind, delta in self._stream_completion(messages, NO_THINK_EXTRA_PAYLOAD):
             if kind == 'thinking':
                 # 内心推理：单独转发给前端作为"思考中"进度，不进正文、不参与围栏判断
                 yield {'type': 'thinking', 'content': delta}
@@ -319,7 +319,7 @@ class AIService:
 3. 补货时间窗口建议
 4. 库存周转优化策略
 
-请用中文输出精炼建议（要点式，正文总长受 system 规则限制）。""",
+请用中文输出精炼建议（要点式，只列重点，不要展开论述）。""",
 
             'trend': f"""你是一个专业的仓库库存管理分析助手。请根据以下库存和交易数据，分析库存变化趋势。
 
@@ -337,11 +337,11 @@ class AIService:
 
         prompt = prompts.get(query_type, prompts['general'])
         return [
-            {'role': 'system', 'content': f'你是一个专业的仓库库存管理分析助手，擅长数据分析和管理建议。请始终用中文回答。'
-                                         '注意：请直接给出结论和可执行建议，尽量简短思考、不要长篇输出内心推理过程，聚焦干货。'
-                                          f'正文总长必须严格控制在 {self.max_analyze_chars} 字以内——用要点或表格精炼表达，只列最重要的商品和建议数量，不要展开论述、不要重复数据。'},
+            {'role': 'system', 'content': '你是一个专业的仓库库存管理分析助手，擅长数据分析和管理建议。请始终用中文回答。'
+                                         '注意：请直接给出结论和可执行建议，聚焦干货，用要点或表格精炼表达，'
+                                          '只列最重要的商品和建议数量，不要展开论述、不要重复数据。'},
             # /no_think：Qwen3 系列开关词，关闭内心推理直接作答。实测分析从 ~195s（4600+ 条 thinking）
-            # 降到 ~10-30s、reasoning 几乎为零；配合上面的正文字数上限，分析又快又短。
+            # 降到 ~10-30s、reasoning 几乎为零。
             {'role': 'user', 'content': prompt + '\n/no_think'},
         ]
 
@@ -355,7 +355,7 @@ class AIService:
             - 'restock': 补货建议
             - 'trend': 趋势分析
         """
-        return self._call(self._build_analyze_messages(query_type), ANALYZE_EXTRA_PAYLOAD)
+        return self._call(self._build_analyze_messages(query_type), NO_THINK_EXTRA_PAYLOAD)
 
     def analyze_stream(self, query_type='general'):
         """流式库存分析。逐段 yield 事件：
@@ -363,26 +363,16 @@ class AIService:
             {'type':'token','content':...}      分析正文增量
             {'type':'done','data':...}          完整分析正文
         分析较长，改用流式可避免 60s 超时；思考型模型的推理也转发，避免思考期"无输出"像卡死。
-
-        正文长度硬上限（self.max_analyze_chars）：prompt 约束模型写短之外再加保险——
-        累计达到上限即停止读取流并直接返回 done。break 会关闭 _stream_completion 生成器，
-        底层 requests 连接随之断开，LM Studio 侧的生成也会提前终止，省时间。
+        正文不做硬截断：模型输出多长就完整推送多长，长度只由 prompt 的风格约束（要点式）软引导。
         """
         messages = self._build_analyze_messages(query_type)
         full = ''
-        limit = self.max_analyze_chars
-        for kind, delta in self._stream_completion(messages, ANALYZE_EXTRA_PAYLOAD):
+        for kind, delta in self._stream_completion(messages, NO_THINK_EXTRA_PAYLOAD):
             if kind == 'thinking':
                 yield {'type': 'thinking', 'content': delta}
                 continue
-            remaining = limit - len(full)
-            if remaining <= 0:
-                break                       # 已达上限，停止读取流
-            piece = delta[:remaining]       # 恰好截到上限，不多推一个字符
-            full += piece
-            yield {'type': 'token', 'content': piece}
-            if len(piece) < len(delta):
-                break                       # 正好触顶，无需再读
+            full += delta
+            yield {'type': 'token', 'content': delta}
         yield {'type': 'done', 'data': full}
 
     def chat(self, user_message):
@@ -418,9 +408,10 @@ class AIService:
 - 先自然回复，再放指令"""
         messages = [
             {'role': 'system', 'content': system_prompt},
-            {'role': 'user', 'content': user_message},
+            # /no_think + 模板级开关双保险，关思考直接作答（与 chat_stream 一致）
+            {'role': 'user', 'content': user_message + '\n/no_think'},
         ]
-        return self._call(messages)
+        return self._call(messages, NO_THINK_EXTRA_PAYLOAD)
 
     def ocr_image(self, image_base64):
         """OCR 识别图片文字"""

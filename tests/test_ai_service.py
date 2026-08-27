@@ -235,7 +235,7 @@ class TestChatStream:
         monkeypatch.setattr(models_mod.SupplierModel, 'get_all', lambda: [])
         monkeypatch.setattr(models_mod.CustomerModel, 'get_all', lambda: [])
 
-        def fake_stream(self, messages):
+        def fake_stream(self, messages, extra_payload=None):
             for c in chunks:
                 # 现在 _stream_completion 产出 (kind, text) 二元的（thinking/token）
                 yield ('token', c)
@@ -253,7 +253,7 @@ class TestChatStream:
 
     def test_forward_thinking_events(self, svc, monkeypatch):
         # 混合 thinking + token：thinking 单独解包为 thinking 事件，不混入正文
-        def fake_stream(self, messages):
+        def fake_stream(self, messages, extra_payload=None):
             yield ('thinking', '思考中')
         monkeypatch.setattr(ai_mod.AIService, '_stream_completion', fake_stream)
         # build_inventory_context 需要 DB：mock 掉
@@ -293,6 +293,28 @@ class TestChatStream:
         assert tokens == '第一段第二段'          # 无重复
         done = [e for e in events if e['type'] == 'done'][0]
         assert done['reply'] == '第一段第二段'    # 剥离指令后正文一致
+
+    def test_chat_disables_thinking(self, svc, monkeypatch):
+        # 对话场景同样带"关思考"开关（模板级 enable_thinking=false）且 prompt 含 /no_think，
+        # 否则思考型模型会先长时间推理，对话又慢又像卡死。
+        captured = {}
+
+        def fake_stream(self, messages, extra_payload=None):
+            captured['extra'] = extra_payload
+            captured['user_msg'] = messages[1]['content']
+            yield ('token', 'ok')
+        monkeypatch.setattr(ai_mod.AIService, '_stream_completion', fake_stream)
+        monkeypatch.setattr(models_mod.InventoryModel, 'get_all', lambda: [])
+        monkeypatch.setattr(models_mod.StatsModel, 'get_dashboard', lambda: {
+            'total_products': 1, 'total_categories': 1, 'total_quantity': 10, 'low_stock_count': 0})
+        monkeypatch.setattr(models_mod.InventoryModel, 'get_low_stock', lambda: [])
+        monkeypatch.setattr(models_mod.TransactionModel, 'get_all', lambda limit=30: [])
+        monkeypatch.setattr(models_mod.SupplierModel, 'get_all', lambda: [])
+        monkeypatch.setattr(models_mod.CustomerModel, 'get_all', lambda: [])
+
+        list(svc.chat_stream('hi'))
+        assert captured['extra'] == ai_mod.NO_THINK_EXTRA_PAYLOAD
+        assert '/no_think' in captured['user_msg']
 
 
 # ==========================================
@@ -342,19 +364,18 @@ class TestAnalyzeStream:
         assert tk == '结论'
         assert done['data'] == '结论'
 
-    def test_hard_cap_limits_output(self, svc, monkeypatch):
-        # 正文长度硬上限：累计达到 max_analyze_chars（默认 600）即停止读取流并返回，不多推一个字符
+    def test_long_output_not_truncated(self, svc, monkeypatch):
+        # 已移除正文硬截断：超过 600 字的长输出必须完整推送，不得截断
         self._patch(monkeypatch, ['A' * 400, 'B' * 400, 'C' * 400], svc)
         events = [e for e in svc.analyze_stream('low_stock')]
         tokens = ''.join(e['content'] for e in events if e['type'] == 'token')
         done = [e for e in events if e['type'] == 'done'][0]
-        limit = svc.max_analyze_chars
-        assert len(tokens) <= limit
-        assert tokens == ('A' * 400 + 'B' * (limit - 400))   # 恰好截到上限
+        assert tokens == 'A' * 400 + 'B' * 400 + 'C' * 400
+        assert len(tokens) > 600          # 明确超过旧硬上限，验证不再截断
         assert done['data'] == tokens
 
-    def test_hard_cap_allows_short_output(self, svc, monkeypatch):
-        # 正文短于上限时不受影响，完整输出
+    def test_short_output_complete(self, svc, monkeypatch):
+        # 短输出完整透传
         self._patch(monkeypatch, ['短', '分析'], svc)
         events = [e for e in svc.analyze_stream('low_stock')]
         tokens = ''.join(e['content'] for e in events if e['type'] == 'token')
@@ -381,5 +402,5 @@ class TestAnalyzeStream:
         monkeypatch.setattr(ai_mod.CustomerModel, 'get_all', lambda: [])
 
         list(svc.analyze_stream('low_stock'))
-        assert captured['extra'] == ai_mod.ANALYZE_EXTRA_PAYLOAD
+        assert captured['extra'] == ai_mod.NO_THINK_EXTRA_PAYLOAD
         assert '/no_think' in captured['user_msg']
